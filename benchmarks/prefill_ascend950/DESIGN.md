@@ -338,12 +338,14 @@ PROMPT引擎不做decode graph capture，但保持forward内部原生实现。�
 所有rank在批结束时保存一个批总事件跨度；返回后等待并将结果通过控制面收集。第r轮、第j步的主指标：
 
 ```text
-span[r] = 批 start/end event 跨度（round r）
-B[r] = span[r] / (iterations × chunks)      # rank 内单步平均
-t[j] = max_{r∈8 ranks}(B[r])
-single_forward: T = t[0] = max_r span[r] / iterations
-chunked_suffix: T = Σ_j t[j] = max_r span[r] / iterations
+span0[r] = rank0 批 start/end event 跨度（round r）
+B[r] = span0[r] / (iterations × chunks)     # rank0 单步平均
+t[j] = B[r]                                  # 只取 rank0
+single_forward: T = t[0] = span0 / iterations
+chunked_suffix: T = Σ_j t[j]
 ```
+
+其余 rank 只参与执行与 outcome 完整性校验，不参与时延统计；trace 默认也只保留 rank0（`profile.export_ranks=rank0`）。
 
 批量计时下所有 iteration 共享同一平均值，raw samples 每个 chunk 都等于 `B`，因此 p50/p95/mean 相同、CV=0；这是“平均 forward 时延”口径，不用于估计分布尾部。
 

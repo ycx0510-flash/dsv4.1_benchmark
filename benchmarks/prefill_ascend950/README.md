@@ -192,7 +192,7 @@ chunked_suffix中，早期chunk可能只有一个decoder占位query；full_len�
 
 | 指标 | 定义 |
 | --- | --- |
-| forward_p50/p95/p99_ms | 批计时：第一个 forward 前记 event，最后一个 forward 结束后记 event，中间不插入 sync/barrier/restore。取 8 rank 批总时长的最大值除以批内 forward 数；批量模式下各样本均等于该平均值，故 p50=p95=p99=mean、CV=0 |
+| forward_p50/p95/p99_ms | 批计时：第一个 forward 前记 event，最后一个 forward 结束后记 event，中间不插入 sync/barrier/restore。**只取 rank0** 的批总时长除以批内 forward 数；其余 rank 只执行并做完整性校验，不参与时延统计。批量模式下各样本均等于该平均值，故 p50=p95=p99=mean、CV=0 |
 | forward / forward_step | `forward` 是整条后缀（各 chunk 之和）的平均耗时，`forward_step` 是单 chunk 平均；single_forward 两者相同 |
 | new_tokens_per_s | 有效新token总数 / 累计forward时间；吞吐分子不含命中前缀 |
 | new_tokens_per_s_per_card | 上项除以8 |

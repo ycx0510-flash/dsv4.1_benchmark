@@ -48,7 +48,7 @@ def aggregate(case: dict, cfg: dict, ranks: list[dict]) -> dict:
     expected = {
         (r, k, j) for r in range(cfg["measurement"]["rounds"]) for k in range(cfg["measurement"]["iterations"]) for j in range(chunks)
     }
-    by_step = defaultdict(list)
+    by_step = defaultdict(dict)
     for outcome in ranks:
         samples = outcome["samples"]
         counts = Counter((s["round"], s["iteration"], s["chunk"]) for s in samples)
@@ -58,11 +58,15 @@ def aggregate(case: dict, cfg: dict, ranks: list[dict]) -> dict:
             ms = sample["forward_ms"]
             if not math.isfinite(ms) or ms <= 0:
                 raise ValueError("Invalid event timing")
-            by_step[(sample["round"], sample["iteration"], sample["chunk"])].append(ms)
+            by_step[(sample["round"], sample["iteration"], sample["chunk"])][outcome["rank"]] = ms
     chains = defaultdict(float)
     step_ms = []
     for (r, k, _), spans in sorted(by_step.items()):
-        span = max(spans)
+        # Latency is rank0's start/end event span only; other ranks execute and are
+        # validated for completeness but never contribute to the timing statistic.
+        if 0 not in spans:
+            raise ValueError("Missing rank0 timing sample")
+        span = spans[0]
         step_ms.append(span)
         chains[(r, k)] += span
     times = list(chains.values())
@@ -79,9 +83,10 @@ def aggregate(case: dict, cfg: dict, ranks: list[dict]) -> dict:
     result.update(
         status="OK" if profile_ok else "timing_ok_profile_failed",
         timing_ok=True,
-        timing_mode=ranks[0].get("timing_mode", "per_forward"),
+        timing_mode=next(x for x in ranks if x["rank"] == 0).get("timing_mode", "per_forward"),
         timing_scope="native_model_forward",
-        timing_statistic="batch_event_span_divided_by_forward_count",
+        timing_rank=0,
+        timing_statistic="rank0_batch_event_span_divided_by_forward_count",
         forward=stats,
         forward_step=distribution(step_ms),
         forward_p50_ms=stats["p50_ms"],
