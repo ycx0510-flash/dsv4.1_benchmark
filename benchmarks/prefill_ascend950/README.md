@@ -19,7 +19,7 @@
 | MoE | 原生强制负载均衡；关闭强制倾斜和动态EPLB重排 |
 | 执行 | single_forward；可显式选择chunked_suffix处理长输入 |
 | 比较口径 | 默认fixed_global；另支持fixed_per_dp |
-| profiling | 独立采集pass，默认只采 rank0（`ranks=all` 可全采），采集时不解析 |
+| profiling | **默认关闭**（`profile.enabled=false`）；显式开启后独立采集pass，默认只采 rank0（`ranks=all` 可全采），采集时不解析 |
 
 首版不包含encoder SWA miss回放、DP异构长度/命中率、decode、采样、图像VE、外部KV存储或P→D网络传输。模型forward内原有的Engram、CP、HC、KV量化/读写、YOCO边界和DSpark cache preparation仍在测量中。
 
@@ -119,7 +119,7 @@ collect依次完成doctor、case plan、warmup、无profiler计时、独立profi
     "timing_scope": "native_model_forward"
   },
   "profile": {
-    "enabled": true,
+    "enabled": false,
     "ranks": "rank0",
     "level": "Level1",
     "wait_steps": 0,
@@ -131,6 +131,8 @@ collect依次完成doctor、case plan、warmup、无profiler计时、独立profi
   }
 }
 ```
+
+`profile.enabled` 默认 false：benchmark 默认只做计时、不采集 trace。需要 profiling 时显式设为 true；CP 长上下文建议同时设置 `ranks=all`（对称采集，避免只采 rank0 时的 CP 错位崩溃）和 `export_ranks=rank0`（只保留 rank0 的 trace）。
 
 L是包含缓存前缀的完整输入长度。h使用[0,1]比例，例如0.9表示目标90%，不是90。
 
@@ -217,7 +219,7 @@ fixed_global适合比较相同总工作量的延迟和吞吐。fixed_per_dp时�
 
 ## Profiling与结果目录
 
-默认在独立pass**只采 rank0**（`profile.ranks=rank0`；设为 `all` 才全采），所有 rank 仍执行相同的 profiling steps。采集阶段**不解析** trace：`profiler_index.json` 只记录 `status=COLLECTED` 和 `expected_active_forwards`，解析留到离线（可调用 `profiler.save_profile_index`）。默认 `wait=0, warmup=0, active=3`，即 profiling pass 共 3 次 forward。profiling 不会污染正式 timing samples。
+profiling 默认关闭（`profile.enabled=false`），只有显式开启后才会在独立 pass 采集。开启后默认**只采 rank0**（`profile.ranks=rank0`；设为 `all` 才全采），所有 rank 仍执行相同的 profiling steps。采集阶段**不解析** trace：`profiler_index.json` 只记录 `status=COLLECTED` 和 `expected_active_forwards`，解析留到离线（可调用 `profiler.save_profile_index`）。默认 `wait=0, warmup=0, active=3`，即 profiling pass 共 3 次 forward。profiling 不会污染正式 timing samples。
 
 profiling pass 与 timing 一样采用连续批执行：整批开始前只 restore state 并同步一次，3 次 forward 连续下发，中间不插入 `synchronize`/`barrier`/`restore`，避免 trace 中两次 forward 之间出现设备空泡；`profiler.step()` 只做 host 侧步进。该连续模式（`profile.continuous=true`，默认）在**只采 rank0** 时对部分原生 CP 形状不稳定：CP2 + 256K/0.97 实测连续 3 次采集均触发 vector core 异常（device error 507035，出错 kernel 在 `_load_paged_kv_cache_kernel` / `_fused_norm_rope_hadamard_cast_store_kvcache_kernel` 之间漂移）——profiler 开销只压在 rank0 上，CP/MoE 集合通信错位。解法是 `profile.ranks=all`（所有 rank 对称采集）+ `profile.export_ranks=rank0`（默认，只保留 rank0 的 trace；其余 rank 写入 `profiler_discard` 临时目录并在 profiling pass 结束后删除，不产生额外文件）。实测该组合连续 3 个 forward 稳定，forward 间设备空隙 0.2–0.6ms（同步式约 66ms）。`profile.continuous=false`（每个 profiled forward 前 restore+同步）仍作为 rank0 单卡采集的兼容回退。这些开关只影响 profiling 采集，不影响 timing pass。
 

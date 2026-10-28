@@ -53,7 +53,8 @@ DEFAULTS = {
     # One timing span covers `iterations` back-to-back forwards (no sync in between).
     "measurement": {"warmup": 0, "iterations": 10, "rounds": 1, "timing_scope": "native_model_forward"},
     "profile": {
-        "enabled": True,
+        # Timing never needs the profiler; trace collection is opt-in.
+        "enabled": False,
         # Only rank 0 is profiled by default; all ranks still run the same steps.
         "ranks": "rank0",
         # ranks selects who runs the profiler (all ranks keeps CP collection stable);
