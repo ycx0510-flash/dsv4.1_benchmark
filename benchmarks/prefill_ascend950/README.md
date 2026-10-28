@@ -209,6 +209,8 @@ fixed_global适合比较相同总工作量的延迟和吞吐。fixed_per_dp时�
 
 默认在独立pass**只采 rank0**（`profile.ranks=rank0`；设为 `all` 才全采），所有 rank 仍执行相同的 profiling steps。采集阶段**不解析** trace：`profiler_index.json` 只记录 `status=COLLECTED` 和 `expected_active_forwards`，解析留到离线（可调用 `profiler.save_profile_index`）。默认 `wait=0, warmup=0, active=3`，即 profiling pass 共 3 次 forward。profiling 不会污染正式 timing samples。
 
+profiling pass 与 timing 一样采用连续批执行：整批开始前只 restore state 并同步一次，3 次 forward 连续下发，中间不插入 `synchronize`/`barrier`/`restore`，避免 trace 中两次 forward 之间出现设备空泡；`profiler.step()` 只做 host 侧步进。
+
 CANN 9.2 在本平台不支持对自定义 AscendC 内核导出 `Input Shapes`（`msprof --aicore-shape=on` 对这些内核仍返回 N/A，只有 aclnn/aten 算子带 shape）。因此 profiling 的 active steps 还会额外写入 `module_shapes.jsonl`，按模块记录输入 tensor 的 shape/dtype，作为 kernel 形状的补充数据；它不影响 kernel_details.csv 本身的 N/A。
 
 ```text

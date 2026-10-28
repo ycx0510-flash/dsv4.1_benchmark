@@ -250,6 +250,38 @@ def _run(cfg: dict, case: dict, mapping: dict, model_dir: str, init_method: str,
         minimum_free = min(minimum_free, torch.npu.mem_get_info()[0])
         return {"count": count, "chunks": chunks, "total_ms": total_ms, "wall_ms": wall_ms, "root_forwards": observed}
 
+    @torch.inference_mode()
+    def run_profile_batch(count: int, profiler: Any, selected: bool, error_state: dict) -> None:
+        """Profiling pass: continuous forwards with no sync/barrier/restore between.
+
+        The previous per-trajectory implementation synchronized after cache
+        restore and after every step, which drained the device queue and left
+        the NPU idle while the host built the next metadata. This mirrors the
+        timing batch instead: restore once, then keep enqueueing forwards.
+        """
+        nonlocal minimum_free
+        with torch.profiler.record_function("prefill950:cache_restore") if profiling_enabled else nullcontext():
+            snapshot.restore()
+            torch.npu.synchronize()  # only once, before the profiled batch
+        active_from = cfg["profile"]["wait_steps"] + cfg["profile"]["warmup_steps"]
+        for pindex in range(count):
+            shape_gate.update(active=selected and pindex >= active_from, pindex=pindex)
+            for step in trajectory:
+                metadata = sequences.metadata(step) if sequences is not None else None
+                with (
+                    torch.profiler.record_function(f"prefill950:case={case['case_id']}:iteration={pindex}:chunk={step['chunk']}")
+                    if profiling_enabled
+                    else nullcontext()
+                ):
+                    output = runner.execute_main_model(metadata, cache.gpu_cache)
+                del output, metadata
+            if profiler is not None and error_state["error"] is None:
+                try:
+                    profiler.step()
+                except Exception as error:
+                    error_state["error"] = f"{type(error).__name__}: {error}"
+        minimum_free = min(minimum_free, torch.npu.mem_get_info()[0])
+
     graph = {"match": False, "kind": "NATIVE_METADATA_AND_MODULE_REPEATABILITY", "external_reference_validated": False}
     if cfg["alignment"]["enabled"]:
         signatures = []
@@ -351,18 +383,16 @@ def _run(cfg: dict, case: dict, mapping: dict, model_dir: str, init_method: str,
                 profiler.start()
             except Exception as error:
                 profile_error = f"{type(error).__name__}: {error}"
-        # All ranks run the same profiling steps; only the selected rank records.
-        for pindex in range(sum(cfg["profile"][k] for k in ("wait_steps", "warmup_steps", "active_steps"))):
-            shape_gate.update(
-                active=selected and pindex >= cfg["profile"]["wait_steps"] + cfg["profile"]["warmup_steps"],
-                pindex=pindex,
-            )
-            run_trajectory(iteration=pindex)
-            if profiler is not None and profile_error is None:
-                try:
-                    profiler.step()
-                except Exception as error:
-                    profile_error = f"{type(error).__name__}: {error}"
+        # All ranks run the same continuous profiling batch; only the selected
+        # rank records. No sync/barrier/restore is inserted between forwards.
+        error_state = {"error": profile_error}
+        run_profile_batch(
+            sum(cfg["profile"][k] for k in ("wait_steps", "warmup_steps", "active_steps")),
+            profiler,
+            selected,
+            error_state,
+        )
+        profile_error = error_state["error"]
         if profiler is not None:
             try:
                 profiler.stop()

@@ -364,7 +364,7 @@ OOM、PATH_MISMATCH、INVALID_CONFIG、PROFILE_FAILED、TIMEOUT和UNSUPPORTED点
 
 ## 10. profiling契约
 
-使用目标torch_npu的CPU+NPU profiler，独立profile pass默认只采 rank0（`profile.ranks=rank0`，设为 `all` 才全采）；采集阶段不解析trace，解析留到离线（`profiler.save_profile_index`）。不沿用只能采driver的HTTP profiler。优先标准`torch_npu.profiler`接口，能力预检检测目标版本支持的活动、级别、schedule和导出函数，不在模块import时假定私有experimental字段一定存在。[R10]
+使用目标torch_npu的CPU+NPU profiler，独立profile pass默认只采 rank0（`profile.ranks=rank0`，设为 `all` 才全采）；采集阶段不解析trace，解析留到离线（`profiler.save_profile_index`）。profiling pass采用连续批执行：批前只restore并同步一次，中间不插入synchronize/barrier/restore，避免两次forward之间出现设备空泡；`profiler.step()`只做host侧步进。不沿用只能采driver的HTTP profiler。优先标准`torch_npu.profiler`接口，能力预检检测目标版本支持的活动、级别、schedule和导出函数，不在模块import时假定私有experimental字段一定存在。[R10]
 
 默认profile preset：Level1、ranks=rank0、wait=0、warmup=0、active=3、record_shapes=true、with_stack=false、profile_memory=false，即 profiling pass 共 3 次 forward。所有rank执行相同step计划，仅选中rank记录trace；不使用同一个输出文件名。性能量化完全来自关闭profiler的timing pass。
 
