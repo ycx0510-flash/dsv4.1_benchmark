@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import shutil
 import socket
+import sys
 import time
 from multiprocessing.process import BaseProcess
 from pathlib import Path
@@ -19,6 +20,73 @@ from .report import aggregate, summarize
 
 POLL_SECONDS = 0.5
 STOP_GRACE_SECONDS = 15.0
+
+
+class Progress:
+    """Case progress display: an in-place bar on a TTY, plain lines otherwise."""
+
+    def __init__(self, total: int, stream=None) -> None:
+        self.total = total
+        self.completed = 0
+        self.failed = 0
+        self.current = ""
+        self.stream = stream or sys.stdout
+        self.tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.last_len = 0
+
+    @property
+    def ok(self) -> int:
+        return self.completed - self.failed
+
+    def _bar(self) -> str:
+        width = 30
+        filled = int(width * self.completed / self.total) if self.total else width
+        return "█" * filled + "░" * (width - filled)
+
+    def _render(self) -> None:
+        if not self.tty:
+            return
+        line = f"\r[{self._bar()}] {self.completed}/{self.total} ok={self.ok} failed={self.failed} | {self.current}"
+        pad = max(0, self.last_len - len(line))
+        self.stream.write(line + " " * pad)
+        self.stream.flush()
+        self.last_len = len(line)
+
+    def _clear(self) -> None:
+        if self.tty and self.last_len:
+            self.stream.write("\r" + " " * self.last_len + "\r")
+            self.stream.flush()
+            self.last_len = 0
+
+    def note(self, text: str) -> None:
+        """Print one log line above the bar without losing the bar state."""
+        self._clear()
+        print(text, file=self.stream, flush=True)
+        self._render()
+
+    def label(self, text: str) -> None:
+        """Change what the bar reports without printing a line."""
+        self.current = text
+        self._render()
+
+    def start_case(self, label: str) -> None:
+        self.current = label
+        if self.tty:
+            self._render()
+        else:
+            print(f"  running: {label}", file=self.stream, flush=True)
+
+    def advance(self, status: str) -> None:
+        self.completed += 1
+        if status != "OK":
+            self.failed += 1
+        self._render()
+
+    def finish(self) -> None:
+        self._clear()
+        if self.tty:
+            self.stream.write(f"[{self._bar()}] {self.completed}/{self.total} ok={self.ok} failed={self.failed}\n")
+            self.stream.flush()
 
 
 def rendezvous() -> str:
@@ -166,7 +234,13 @@ def execute_case(cfg: dict, case: dict, devices: list[int], model_dir: Path, dir
     return result
 
 
-def watch_group(cfg: dict, processes: list[BaseProcess], pending: list[tuple[dict, Path]], group_dir: Path) -> dict:
+def watch_group(
+    cfg: dict,
+    processes: list[BaseProcess],
+    pending: list[tuple[dict, Path]],
+    group_dir: Path,
+    progress: Progress,
+) -> dict:
     """Wait for model load, then report completed cases and the first failure.
 
     Returns one of: done / load_failed / load_timeout / case_failed /
@@ -185,11 +259,11 @@ def watch_group(cfg: dict, processes: list[BaseProcess], pending: list[tuple[dic
         if time.monotonic() - load_started > timeout:
             return {"phase": "load_timeout", "detail": "model load exceeded case_timeout_s"}
         time.sleep(POLL_SECONDS)
-    print(f"  model loaded in {time.monotonic() - load_started:.1f}s", flush=True)
+    progress.note(f"  model loaded in {time.monotonic() - load_started:.1f}s")
 
     index = 0
     current_started = time.monotonic()
-    print(f"  running: {pending[index][1].name}", flush=True)
+    progress.start_case(pending[index][1].name)
     while True:
         case, directory = pending[index]
         if all((directory / f"rank_{rank}" / "outcome.json").exists() for rank in range(8)):
@@ -202,7 +276,7 @@ def watch_group(cfg: dict, processes: list[BaseProcess], pending: list[tuple[dic
                     time.sleep(POLL_SECONDS)
                 return {"phase": "done", "aggregated": index, "last": result}
             current_started = time.monotonic()
-            print(f"  running: {pending[index][1].name}", flush=True)
+            progress.start_case(pending[index][1].name)
             continue
         failures = [p for p in processes if p.exitcode is not None and p.exitcode != 0]
         if failures:
@@ -225,7 +299,7 @@ def execute_group(
     devices: list[int],
     model_dir: Path,
     output: Path,
-    progress: dict,
+    progress: Progress,
 ) -> None:
     """Run a group with one model load; restart the group after a case failure."""
     remaining = list(pending)
@@ -242,13 +316,11 @@ def execute_group(
                 continue
             result = json.loads(path.read_text(encoding="utf-8"))
             reported.add(case["case_id"])
-            progress["completed"] += 1
-            progress["failed"] += result["status"] != "OK"
-            print(
-                f"[{progress['completed']}/{progress['total']}] {directory.name} "
-                f"{result['status']} {result.get('forward_p50_ms', '')}",
-                flush=True,
+            progress.note(
+                f"[{progress.completed + 1}/{progress.total}] {directory.name} "
+                f"{result['status']} {result.get('forward_p50_ms', '')}"
             )
+            progress.advance(result["status"])
 
     while remaining:
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
@@ -271,13 +343,13 @@ def execute_group(
         # next attempt aggregate stale files from a dead worker group.
         for _, directory in remaining:
             reset_case_outputs(directory)
-        print(
-            f"  loading model: strategy={group['strategy']} capacity={group['capacity']} cases={len(remaining)}",
-            flush=True,
+        progress.note(
+            f"  loading model: strategy={group['strategy']} capacity={group['capacity']} cases={len(remaining)}"
         )
+        progress.label(f"loading model (capacity={group['capacity']})")
         processes = spawn_ranks(cfg, remaining, mapping, model_dir, rendezvous(), group_dir)
         try:
-            outcome = watch_group(cfg, processes, remaining, group_dir)
+            outcome = watch_group(cfg, processes, remaining, group_dir, progress)
         finally:
             terminate(processes)
 
@@ -312,7 +384,7 @@ def execute_group(
 
 
 def run_batch(cfg: dict, cases: list[dict], devices: list[int], model_dir: Path, output: Path, resume: bool) -> int:
-    progress = {"completed": 0, "failed": 0, "total": len(cases)}
+    progress = Progress(len(cases))
     for case in cases:
         if case["status"] == "PLANNED":
             continue
@@ -320,13 +392,12 @@ def run_batch(cfg: dict, cases: list[dict], devices: list[int], model_dir: Path,
         directory.mkdir(parents=True, exist_ok=True)
         write_json(directory / "case.json", case)
         write_json(directory / "result.json", dict(case, timing_ok=False))
-        progress["completed"] += 1
-        progress["failed"] += 1
-        print(f"[{progress['completed']}/{progress['total']}] {directory.name} {case['status']}", flush=True)
+        progress.note(f"[{progress.completed + 1}/{progress.total}] {directory.name} {case['status']}")
+        progress.advance(case["status"])
 
     groups = batch_groups(cases, cfg)
     planned = sum(len(group["cases"]) for group in groups)
-    print(f"batch execution: {planned} cases in {len(groups)} model load(s)", flush=True)
+    progress.note(f"batch execution: {planned} cases in {len(groups)} model load(s)")
     for number, group in enumerate(groups, 1):
         pending: list[tuple[dict, Path]] = []
         for case in group["cases"]:
@@ -334,8 +405,8 @@ def run_batch(cfg: dict, cases: list[dict], devices: list[int], model_dir: Path,
             if existing is not None:
                 result_path = existing / "result.json"
                 if result_path.exists() and json.loads(result_path.read_text(encoding="utf-8")).get("status") == "OK":
-                    progress["completed"] += 1
-                    print(f"[{progress['completed']}/{progress['total']}] {existing.name} already OK", flush=True)
+                    progress.note(f"[{progress.completed + 1}/{progress.total}] {existing.name} already OK")
+                    progress.advance("OK")
                     continue
                 # Preserve failed attempts; never mix stale rank outcomes with a new run.
                 previous = output / "attempts" / f"{existing.name}-{time.time_ns()}"
@@ -348,13 +419,13 @@ def run_batch(cfg: dict, cases: list[dict], devices: list[int], model_dir: Path,
             pending.append((case, directory))
         if not pending:
             continue
-        print(
+        progress.note(
             f"=== group {number}/{len(groups)} strategy={group['strategy']} "
-            f"capacity={group['capacity']} cases={len(pending)} (one model load) ===",
-            flush=True,
+            f"capacity={group['capacity']} cases={len(pending)} (one model load) ==="
         )
         execute_group(cfg, group, pending, devices, model_dir, output, progress)
-    return progress["failed"]
+    progress.finish()
+    return progress.failed
 
 
 def run(cfg: dict, devices: list[int], model_dir: Path, output: Path, resume: bool = False) -> dict:
@@ -382,22 +453,29 @@ def run(cfg: dict, devices: list[int], model_dir: Path, output: Path, resume: bo
         if cfg["batch"]["enabled"]:
             failed = run_batch(cfg, cases, devices, model_dir.resolve(), output, resume)
         else:
-            for number, case in enumerate(cases, 1):
+            progress = Progress(len(cases))
+            for case in cases:
                 existing = find_case_directory(output, case["case_id"]) if resume else None
                 if existing is not None:
                     result_path = existing / "result.json"
                     if result_path.exists() and json.loads(result_path.read_text(encoding="utf-8")).get("status") == "OK":
-                        print(f"[{number}/{len(cases)}] {existing.name} already OK", flush=True)
+                        progress.note(f"[{progress.completed + 1}/{progress.total}] {existing.name} already OK")
+                        progress.advance("OK")
                         continue
                     # Preserve failed attempts; never mix stale rank outcomes with a new run.
                     previous = output / "attempts" / f"{existing.name}-{time.time_ns()}"
                     previous.parent.mkdir(parents=True, exist_ok=True)
                     existing.rename(previous)
                 directory = case_directory(output, case)
-                print(f"[{number}/{len(cases)}] {directory.name}", flush=True)
+                progress.start_case(directory.name)
                 result = execute_case(cfg, case, devices, model_dir.resolve(), directory)
                 failed += result["status"] != "OK"
-                print(f"  {result['status']} {result.get('forward_p50_ms', '')}", flush=True)
+                progress.note(
+                    f"[{progress.completed + 1}/{progress.total}] {directory.name} "
+                    f"{result['status']} {result.get('forward_p50_ms', '')}"
+                )
+                progress.advance(result["status"])
+            progress.finish()
         summary = summarize(output)
         return {"ok": failed == 0, "output": str(output), **summary}
     finally:

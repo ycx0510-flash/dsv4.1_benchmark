@@ -215,7 +215,7 @@ fixed_global适合比较相同总工作量的延迟和吞吐。fixed_per_dp时�
 
 容错：某个 case 在任一 rank 抛错（含 OOM）时，该 rank 写 `rank_*/error.json` 后退出；launcher 终止本组进程、把该 case 标为 FAILED/OOM，然后用剩余 case 重新加载并继续，不会中断整个扫描。整组模型加载失败时只把该组剩余 case 标为 FAILED 并继续下一组，不会影响其他容量带。每个 case 仍受 `runtime.case_timeout_s` 限制。
 
-进度：stdout 按 `[完成数/总数]` 输出每个 case 的 `running`/`OK`/`FAILED` 与 `forward_p50_ms`；每组开始时打印 `loading model ... capacity=...` 和加载耗时。组级日志与 `ready_rank_*.json` 在 `groups/<strategy>_cap<capacity>_<stamp>/`，case 结果目录结构不变。`max_cases_per_group` 可限制单组 case 数（0 表示不限制），CLI 可用 `--batch-cases/--no-batch-cases` 覆盖开关。诊断时可用 `PREFILL950_FAIL_CASE=<case_id>[,<case_id>]` 注入 case 失败，验证失败续跑。
+进度：终端为 TTY 时在 stdout 显示原地刷新的进度条 `[████░░…] 已完成/总数 ok=… failed=… | 当前 case`，模型加载时显示 `loading model (capacity=…)`；重定向到文件/管道时退化为逐行 `running`/`OK`/`FAILED` 输出。每组开始时打印 `loading model ... capacity=...` 和加载耗时。组级日志与 `ready_rank_*.json` 在 `groups/<strategy>_cap<capacity>_<stamp>/`，case 结果目录结构不变。`max_cases_per_group` 可限制单组 case 数（0 表示不限制），CLI 可用 `--batch-cases/--no-batch-cases` 覆盖开关。诊断时可用 `PREFILL950_FAIL_CASE=<case_id>[,<case_id>]` 注入 case 失败，验证失败续跑。
 
 ## Profiling与结果目录
 

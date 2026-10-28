@@ -205,7 +205,7 @@ hook内不做synchronize、barrier、日志落盘或CPU读取tensor；这些操�
 
 模型构建时的 `max_num_batched_tokens` 决定通信 workspace 规模（实测约 128 KB/token），所以分组按 case 需要的 `max_rows_per_rank` 取 2 的幂分桶（`capacity_grouping=power2`），每组容量取组内最大；`single` 为每策略一次加载（大 L 低命中会 OOM，整组失败）。这样“一次加载”不会用一个 1M case 的容量拖垮全部 case。
 
-失败语义：launcher 只从 8 个 rank 的 `outcome.json` 聚合结果，任一 rank 失败时该 case 不会被发布。case 级失败（含 OOM/超时）终止本组进程，把当前 case 标为 FAILED/OOM/TIMEOUT/INCOMPLETE，然后用剩余 case 重新加载继续；组内模型加载失败则只把该组剩余 case 标为 FAILED，继续下一组。`runtime.case_timeout_s` 按 case 计时（从上一个 case 完成或模型就绪开始）。进度写 stdout；组日志写 `groups/.../rank_*/worker.log`，`ready_rank_*.json` 用于区分加载失败和 case 失败。
+失败语义：launcher 只从 8 个 rank 的 `outcome.json` 聚合结果，任一 rank 失败时该 case 不会被发布。case 级失败（含 OOM/超时）终止本组进程，把当前 case 标为 FAILED/OOM/TIMEOUT/INCOMPLETE，然后用剩余 case 重新加载继续；组内模型加载失败则只把该组剩余 case 标为 FAILED，继续下一组。`runtime.case_timeout_s` 按 case 计时（从上一个 case 完成或模型就绪开始）。进度写 stdout：TTY 下为原地刷新的进度条（已完成/总数、ok/failed、当前 case/模型加载），非 TTY 退化为逐行输出；组日志写 `groups/.../rank_*/worker.log`，`ready_rank_*.json` 用于区分加载失败和 case 失败。
 
 ## 6. metadata契约
 
