@@ -199,6 +199,14 @@ hook内不做synchronize、barrier、日志落盘或CPU读取tensor；这些操�
 
 新hook若无法正确覆盖原生异步子流完成依赖，验收失败：必须用NPU trace确认end event位于相关工作完成之后。禁止简单相加kernel duration作为forward时延。
 
+### 5.4 批量执行与容错
+
+`batch.enabled=true` 时 controller 对同一并行策略的 case 分组，每组 spawn 一次八个 rank；子进程内加载一次模型，随后按固定顺序执行组内全部 case。每个 case 仍完整走原生 cache 分配、synthetic cache 造数、state 快照、alignment/warmup、计时和 profiling；case 结束释放 cache/state 与 per-case metadata，模型、Engram buffer 与通信 workspace 常驻。计时口径与单 case 完全一致。
+
+模型构建时的 `max_num_batched_tokens` 决定通信 workspace 规模（实测约 128 KB/token），所以分组按 case 需要的 `max_rows_per_rank` 取 2 的幂分桶（`capacity_grouping=power2`），每组容量取组内最大；`single` 为每策略一次加载（大 L 低命中会 OOM，整组失败）。这样“一次加载”不会用一个 1M case 的容量拖垮全部 case。
+
+失败语义：launcher 只从 8 个 rank 的 `outcome.json` 聚合结果，任一 rank 失败时该 case 不会被发布。case 级失败（含 OOM/超时）终止本组进程，把当前 case 标为 FAILED/OOM/TIMEOUT/INCOMPLETE，然后用剩余 case 重新加载继续；组内模型加载失败则只把该组剩余 case 标为 FAILED，继续下一组。`runtime.case_timeout_s` 按 case 计时（从上一个 case 完成或模型就绪开始）。进度写 stdout；组日志写 `groups/.../rank_*/worker.log`，`ready_rank_*.json` 用于区分加载失败和 case 失败。
+
 ## 6. metadata契约
 
 ### 6.1 只构造请求描述，不重写派生metadata

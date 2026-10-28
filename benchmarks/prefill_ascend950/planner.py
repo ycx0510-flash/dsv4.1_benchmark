@@ -99,6 +99,50 @@ def plan(cfg: dict) -> list[dict]:
     return result
 
 
+def case_capacity(case: dict, mtp_draft_length: int) -> int:
+    """Token bound the native model is built with for this case (per rank)."""
+    return max(case["per_dp_batch_size"] * (mtp_draft_length + 1), case["cp"] * case["max_rows_per_rank"])
+
+
+def batch_groups(cases: list[dict], cfg: dict) -> list[dict]:
+    """Split planned cases into groups that share one native model load.
+
+    Model construction sizes communication workspaces by max_num_batched_tokens,
+    so a group is built for the largest capacity it contains. ``power2`` keeps a
+    group inside a 2x capacity band (long prompts cannot OOM short ones in the
+    same load); ``single`` uses one group per strategy at the largest capacity.
+    """
+    grouping = cfg["batch"]["capacity_grouping"]
+    limit = cfg["batch"]["max_cases_per_group"]
+    buckets: dict[tuple[str, int], list[dict]] = {}
+    order: list[tuple[str, int]] = []
+    for case in cases:
+        if case.get("status") != "PLANNED":
+            continue
+        capacity = case_capacity(case, cfg["runtime"]["mtp_draft_length"])
+        band = 0 if grouping == "single" else 1 << (capacity - 1).bit_length()
+        key = (case["strategy"], band)
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(case)
+    groups = []
+    for key in order:
+        members = buckets[key]
+        chunks = [members] if not limit else [members[i : i + limit] for i in range(0, len(members), limit)]
+        for chunk in chunks:
+            groups.append(
+                {
+                    "strategy": key[0],
+                    "capacity": max(case_capacity(case, cfg["runtime"]["mtp_draft_length"]) for case in chunk),
+                    "cases": chunk,
+                }
+            )
+    strategy_order = {name: index for index, name in enumerate(cfg["parallel"]["strategies"])}
+    groups.sort(key=lambda group: (strategy_order[group["strategy"]], group["capacity"]))
+    return groups
+
+
 def rank_mapping(case: dict, devices: list[int]) -> list[dict]:
     return [
         {

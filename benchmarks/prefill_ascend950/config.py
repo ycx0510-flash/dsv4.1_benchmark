@@ -66,6 +66,20 @@ DEFAULTS = {
         "profile_memory": False,
     },
     "alignment": {"enabled": True},
+    # Batch execution: load the native model once per group and run several cases
+    # in the same eight rank processes. Model construction sizes communication
+    # workspaces by max_num_batched_tokens, so cases are grouped by the capacity
+    # they need; an oversized group fails at load without blocking smaller ones.
+    "batch": {
+        "enabled": False,
+        # power2: one load per (strategy, next power of two of required rows).
+        # single: one load per strategy using the largest case; long prompts can
+        # exceed HBM and fail the whole strategy.
+        "capacity_grouping": "power2",
+        # 0 = unlimited; otherwise split a group into chunks to bound the blast
+        # radius of a case that kills the worker group.
+        "max_cases_per_group": 0,
+    },
 }
 
 
@@ -112,11 +126,16 @@ def resolve(raw: dict) -> dict:
         cfg[section].update(values)
     if type(cfg["schema_version"]) is not int or cfg["schema_version"] != 1:
         raise ValueError("Only schema_version=1 is supported")
-    r, p, w, y, m, measure, prof = (cfg[k] for k in ("runtime", "parallel", "workload", "yoco", "moe", "measurement", "profile"))
-    for section in ("yoco", "profile", "alignment", "moe"):
+    r, p, w, y, m, measure, prof, b = (
+        cfg[k] for k in ("runtime", "parallel", "workload", "yoco", "moe", "measurement", "profile", "batch")
+    )
+    for section in ("yoco", "profile", "alignment", "moe", "batch"):
         for key, default in DEFAULTS[section].items():
             if type(default) is bool and type(cfg[section][key]) is not bool:
                 raise ValueError(f"{section}.{key} must be a boolean")
+    if b["capacity_grouping"] not in ("power2", "single"):
+        raise ValueError("batch.capacity_grouping must be power2/single")
+    integer(b["max_cases_per_group"], "batch.max_cases_per_group", 0)
     for name in ("max_model_len", "case_timeout_s"):
         integer(r[name], f"runtime.{name}")
     integer(r["seed"], "runtime.seed", 0)

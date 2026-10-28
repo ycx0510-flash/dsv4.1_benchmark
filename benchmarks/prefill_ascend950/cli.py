@@ -36,6 +36,12 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--model-dir", type=Path, required=True)
         if name == "run":
             command.add_argument("--resume", action="store_true")
+            command.add_argument(
+                "--batch-cases",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+                help="Load the native model once per capacity group and run many cases (overrides batch.enabled)",
+            )
     command = commands.add_parser("summarize")
     command.add_argument("--run", type=Path, required=True)
     command.add_argument("--no-plots", action="store_true")
@@ -61,6 +67,8 @@ def main(argv: list[str] | None = None) -> int:
             cfg = load(args.config) if args.config else resolve({})
             if args.weights:
                 cfg["runtime"]["weights"] = args.weights
+            if args.command == "run" and args.batch_cases is not None:
+                cfg["batch"]["enabled"] = args.batch_cases
         if args.command == "plan":
             from .planner import plan, steps
 

@@ -205,6 +205,16 @@ chunked_suffix中，早期chunk可能只有一个decoder占位query；full_len�
 
 fixed_global适合比较相同总工作量的延迟和吞吐。fixed_per_dp时总请求数随DP改变，输出延迟/吞吐Pareto。若数值差异落在测量噪声内，标为tie/不确定。
 
+## 批量执行（一次加载、多个 case）
+
+同一并行策略下逐个 case 重新加载模型（dummy 权重约 60s/次）在扫描大量 L×命中率时占主导。`batch.enabled=true` 时，launcher 把同一策略的 case 分组，每组只加载一次原生模型，随后在同样的 8 个 rank 进程内依次执行组内 case：每个 case 重新分配 KV cache/state、造数、计时和 profiling，结束后释放；模型、Engram buffer 和通信 workspace 保持常驻。
+
+模型构建时 `max_num_batched_tokens` 会按 token 数预分配通信 workspace（实测约 128 KB/token，7936 token ≈ 0.95 GiB SymmBuffer），因此不能按整个扫描的最大 L 只加载一次：1M/低命中 case 的容量会拖垮全部 case。默认 `batch.capacity_grouping=power2`，按每个 case 需要的 `max_rows_per_rank` 向上取 2 的幂分桶，每组只在同一 2× 容量带内加载；`single` 表示每策略只按最大容量加载（可能 OOM）。完整扫描示例见 `configs/sweep_v41_full.json`（20 个 L × 11 个命中率，220 个 case 分为 13 组、共 13 次加载）。
+
+容错：某个 case 在任一 rank 抛错（含 OOM）时，该 rank 写 `rank_*/error.json` 后退出；launcher 终止本组进程、把该 case 标为 FAILED/OOM，然后用剩余 case 重新加载并继续，不会中断整个扫描。整组模型加载失败时只把该组剩余 case 标为 FAILED 并继续下一组，不会影响其他容量带。每个 case 仍受 `runtime.case_timeout_s` 限制。
+
+进度：stdout 按 `[完成数/总数]` 输出每个 case 的 `running`/`OK`/`FAILED` 与 `forward_p50_ms`；每组开始时打印 `loading model ... capacity=...` 和加载耗时。组级日志与 `ready_rank_*.json` 在 `groups/<strategy>_cap<capacity>_<stamp>/`，case 结果目录结构不变。`max_cases_per_group` 可限制单组 case 数（0 表示不限制），CLI 可用 `--batch-cases/--no-batch-cases` 覆盖开关。诊断时可用 `PREFILL950_FAIL_CASE=<case_id>[,<case_id>]` 注入 case 失败，验证失败续跑。
+
 ## Profiling与结果目录
 
 默认在独立pass**只采 rank0**（`profile.ranks=rank0`；设为 `all` 才全采），所有 rank 仍执行相同的 profiling steps。采集阶段**不解析** trace：`profiler_index.json` 只记录 `status=COLLECTED` 和 `expected_active_forwards`，解析留到离线（可调用 `profiler.save_profile_index`）。默认 `wait=0, warmup=0, active=3`，即 profiling pass 共 3 次 forward。profiling 不会污染正式 timing samples。
