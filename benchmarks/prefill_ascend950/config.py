@@ -54,10 +54,12 @@ DEFAULTS = {
     "measurement": {"warmup": 0, "iterations": 10, "rounds": 1, "timing_scope": "native_model_forward"},
     "profile": {
         "enabled": True,
-        "ranks": "all",
+        # Only rank 0 is profiled by default; all ranks still run the same steps.
+        "ranks": "rank0",
         "level": "Level1",
-        "wait_steps": 1,
-        "warmup_steps": 2,
+        # wait + warmup + active = number of forward calls in the profiling pass.
+        "wait_steps": 0,
+        "warmup_steps": 0,
         "active_steps": 3,
         "record_shapes": True,
         "with_stack": False,
@@ -182,8 +184,8 @@ def resolve(raw: dict) -> dict:
         integer(measure[key], f"measurement.{key}", 0 if key == "warmup" else 1)
     if measure["timing_scope"] != "native_model_forward":
         raise ValueError("Only native_model_forward timing is supported")
-    if prof["ranks"] != "all" or prof["level"] not in ("Level0", "Level1", "Level2"):
-        raise ValueError("Profile requires all ranks and Level0/Level1/Level2")
+    if prof["ranks"] not in ("all", "rank0") or prof["level"] not in ("Level0", "Level1", "Level2"):
+        raise ValueError("Profile requires ranks all/rank0 and Level0/Level1/Level2")
     for key in ("wait_steps", "warmup_steps", "active_steps"):
         integer(prof[key], f"profile.{key}", 1 if key == "active_steps" else 0)
     return cfg

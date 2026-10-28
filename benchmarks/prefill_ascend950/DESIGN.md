@@ -149,7 +149,7 @@ flowchart TD
     F --> G[ModelRunner.execute_main_model]
     G --> H[原生VL wrapper与40层模型]
     H --> I[每rank计时; 控制面汇总]
-    E --> J[独立profiling pass: 全部8个rank]
+    E --> J[独立profiling pass: 默认仅rank0]
     J --> K[trace文件与索引]
     I --> L[汇总表及策略选择]
     K --> L
@@ -321,7 +321,7 @@ PROMPT引擎不做decode graph capture，但保持forward内部原生实现。�
 → native初始化、dummy/real加载和cache准备
 → 全shape warmup与JIT收敛
 → timing pass（profiler关闭）
-→ 独立profiling pass（全部8个rank）
+→ 独立profiling pass（默认仅rank0；可配all）
 → 统一汇总和排名
 ```
 
@@ -364,15 +364,15 @@ OOM、PATH_MISMATCH、INVALID_CONFIG、PROFILE_FAILED、TIMEOUT和UNSUPPORTED点
 
 ## 10. profiling契约
 
-使用目标torch_npu的CPU+NPU profiler，独立profile pass默认采集全部8个rank；不沿用只能采driver的HTTP profiler。优先标准`torch_npu.profiler`接口，能力预检检测目标版本支持的活动、级别、schedule和导出函数，不在模块import时假定私有experimental字段一定存在。[R10]
+使用目标torch_npu的CPU+NPU profiler，独立profile pass默认只采 rank0（`profile.ranks=rank0`，设为 `all` 才全采）；采集阶段不解析trace，解析留到离线（`profiler.save_profile_index`）。不沿用只能采driver的HTTP profiler。优先标准`torch_npu.profiler`接口，能力预检检测目标版本支持的活动、级别、schedule和导出函数，不在模块import时假定私有experimental字段一定存在。[R10]
 
-默认profile preset：Level1、wait=1、warmup=2、active=3、record_shapes=true、with_stack=false、profile_memory=false。所有rank采用相同step计划；不使用同一个输出文件名。性能量化完全来自关闭profiler的timing pass。
+默认profile preset：Level1、ranks=rank0、wait=0、warmup=0、active=3、record_shapes=true、with_stack=false、profile_memory=false，即 profiling pass 共 3 次 forward。所有rank执行相同step计划，仅选中rank记录trace；不使用同一个输出文件名。性能量化完全来自关闭profiler的timing pass。
 
 标准导出保留原生Ascend结果目录、timeline/summary及rank→文件索引。采用trace-handler导出时不再对同一个profiler对象重复调用`export_chrome_trace`，避免接口模式冲突；从原生结果确定可消费的trace文件，并记录路径。Level1/2或硬件counter采集为显式额外preset，目标栈不支持则报明原因。
 
 只读范围标记至少有case/iteration/chunk/forward；metadata构造、cache restore在forward范围外可见。shape/branch alignment pass可使用更多observer，正式timing移除这些额外观测开销。不要将异构rank的绝对时间戳直接拼接成已对时的timeline。
 
-验收profile文件时检查：8个rank均存在、active step数完整、有实际NPU kernel而不只是CPU调用、至少可识别FlashMLA/MegaMoE/CP及shape证据。若profile部分失败，timing保留但case标记`timing_ok_profile_failed`，collect总退出码非0。
+采集后`profiler_index.json`只记录`status=COLLECTED`与`expected_active_forwards`，不解析trace；离线解析时再调用`save_profile_index`。验收profile文件时检查：选中的rank存在、active step数完整（默认3）、有实际NPU kernel而不只是CPU调用、至少可识别FlashMLA/MegaMoE/CP及shape证据。若profile采集或导出失败，timing保留但case标记`timing_ok_profile_failed`，collect总退出码非0。
 
 ## 11. 输出与复现
 

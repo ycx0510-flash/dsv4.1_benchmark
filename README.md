@@ -26,4 +26,5 @@ Timing uses one NPU event pair around `iterations` back-to-back forwards (defaul
 ## Notes
 
 - `runtime.engram=true` (default) stages the Engram tables on CPU and writes the per-rank 1/8 shard into the device `EngramBuffer` (device-side cross-rank fetch).
+- Profiling defaults to rank 0 only (`profile.ranks=rank0`), runs 3 profiling forwards (`wait=0/warmup=0/active=3`), and does not parse traces at collection time; `profiler_index.json` is marked `COLLECTED` and parsing is deferred offline.
 - Profiling defaults to Level1: `kernel_details.csv` carries the full 49-column CANN table (shapes for aclnn/aten ops, AIC/AIV metrics for all kernels). Custom AscendC kernels do not expose input shapes on this CANN build; `module_shapes.jsonl` records module-level shapes as a companion dataset.

@@ -19,7 +19,7 @@
 | MoE | 原生强制负载均衡；关闭强制倾斜和动态EPLB重排 |
 | 执行 | single_forward；可显式选择chunked_suffix处理长输入 |
 | 比较口径 | 默认fixed_global；另支持fixed_per_dp |
-| profiling | 独立采集pass，覆盖全部8个rank |
+| profiling | 独立采集pass，默认只采 rank0（`ranks=all` 可全采），采集时不解析 |
 
 首版不包含encoder SWA miss回放、DP异构长度/命中率、decode、采样、图像VE、外部KV存储或P→D网络传输。模型forward内原有的Engram、CP、HC、KV量化/读写、YOCO边界和DSpark cache preparation仍在测量中。
 
@@ -57,7 +57,7 @@ bash benchmarks/prefill_ascend950/deploy.sh \
   --model-dir /data/models/DeepSeek-V4.1-Flash-1017 \
   --weights dummy
 
-# 2. 一键跑四种策略，并采集全部8个rank的trace及比较报表。
+# 2. 一键跑四种策略；默认只采 rank0 的 trace，解析留到离线。
 bash benchmarks/prefill_ascend950/collect.sh \
   --venv .venv-prefill950 \
   --config benchmarks/prefill_ascend950/configs/smoke.json \
@@ -120,10 +120,10 @@ collect依次完成doctor、case plan、warmup、无profiler计时、独立profi
   },
   "profile": {
     "enabled": true,
-    "ranks": "all",
+    "ranks": "rank0",
     "level": "Level1",
-    "wait_steps": 1,
-    "warmup_steps": 2,
+    "wait_steps": 0,
+    "warmup_steps": 0,
     "active_steps": 3,
     "record_shapes": true,
     "with_stack": false,
@@ -207,7 +207,7 @@ fixed_global适合比较相同总工作量的延迟和吞吐。fixed_per_dp时�
 
 ## Profiling与结果目录
 
-默认在独立pass采8个rank，不只采DP driver。保留torch_npu生成的原生结果、trace/summary及索引；Level0/1/2实际能力先在目标版本检查。shape采集和profiling均不会污染正式timing samples。
+默认在独立pass**只采 rank0**（`profile.ranks=rank0`；设为 `all` 才全采），所有 rank 仍执行相同的 profiling steps。采集阶段**不解析** trace：`profiler_index.json` 只记录 `status=COLLECTED` 和 `expected_active_forwards`，解析留到离线（可调用 `profiler.save_profile_index`）。默认 `wait=0, warmup=0, active=3`，即 profiling pass 共 3 次 forward。profiling 不会污染正式 timing samples。
 
 CANN 9.2 在本平台不支持对自定义 AscendC 内核导出 `Input Shapes`（`msprof --aicore-shape=on` 对这些内核仍返回 N/A，只有 aclnn/aten 算子带 shape）。因此 profiling 的 active steps 还会额外写入 `module_shapes.jsonl`，按模块记录输入 tensor 的 shape/dtype，作为 kernel 形状的补充数据；它不影响 kernel_details.csv 本身的 N/A。
 
@@ -222,8 +222,8 @@ results/<run_id>/
       worker.log / native_contract.json
       samples.jsonl / outcome.json / module_shapes.jsonl
       graph_signature_0.json / graph_signature_1.json
-      profiler_index.json
-      profiler/...                # 原生 Ascend trace/summary
+      profiler_index.json         # 仅选中 rank（默认 rank0），采集后 status=COLLECTED
+      profiler/...                # 原生 Ascend trace/summary，仅选中 rank
   doctor/doctor.json
   attempts/...                   # resume 时归档的失败尝试
 ```

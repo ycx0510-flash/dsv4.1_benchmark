@@ -76,7 +76,7 @@ def _run(cfg: dict, case: dict, mapping: dict, model_dir: str, init_method: str,
     from deepinfer.worker.cache_engine import CacheEngine
 
     from .alignment import NativeDiagnostic
-    from .profiler import create_profiler, save_profile_index
+    from .profiler import create_profiler
     from .workload import NativeSequences, StateSnapshot, seed_cache
 
     class BenchWorker(WorkerBase):
@@ -337,21 +337,24 @@ def _run(cfg: dict, case: dict, mapping: dict, model_dir: str, init_method: str,
 
         return hook
 
-    profile = {"valid": False, "status": "DISABLED"}
+    profile = {"valid": None, "status": "DISABLED"}
     if cfg["profile"]["enabled"]:
-        profiling_enabled = True
-        shape_handles = [module.register_forward_pre_hook(shape_hook(name)) for name, module in model.named_modules()]
+        selected = cfg["profile"]["ranks"] == "all" or mapping["global_rank"] == 0
+        profiling_enabled = selected
+        profile = {"valid": None, "status": "SKIPPED", "rank": mapping["global_rank"]}
+        shape_handles = []
         profiler, profile_error = None, None
-        try:
-            profiler = create_profiler(directory / "profiler", cfg["profile"], mapping["global_rank"])
-            profiler.start()
-        except Exception as error:
-            profile_error = f"{type(error).__name__}: {error}"
-        # Keep all ranks on the same model collective trajectory, even if one
-        # rank cannot start profiling. Timing samples above remain available.
+        if selected:
+            shape_handles = [module.register_forward_pre_hook(shape_hook(name)) for name, module in model.named_modules()]
+            try:
+                profiler = create_profiler(directory / "profiler", cfg["profile"], mapping["global_rank"])
+                profiler.start()
+            except Exception as error:
+                profile_error = f"{type(error).__name__}: {error}"
+        # All ranks run the same profiling steps; only the selected rank records.
         for pindex in range(sum(cfg["profile"][k] for k in ("wait_steps", "warmup_steps", "active_steps"))):
             shape_gate.update(
-                active=pindex >= cfg["profile"]["wait_steps"] + cfg["profile"]["warmup_steps"],
+                active=selected and pindex >= cfg["profile"]["wait_steps"] + cfg["profile"]["warmup_steps"],
                 pindex=pindex,
             )
             run_trajectory(iteration=pindex)
@@ -369,12 +372,20 @@ def _run(cfg: dict, case: dict, mapping: dict, model_dir: str, init_method: str,
         shape_gate["active"] = False
         for shape_handle in shape_handles:
             shape_handle.remove()
-        write_jsonl(directory / "module_shapes.jsonl", shape_records)
-        profile = save_profile_index(directory / "profiler", cfg["profile"]["active_steps"] * len(trajectory))
-        profile.update(status="FAILED" if profile_error or not profile["valid"] else "OK", error=profile_error)
-        if profile_error:
-            profile["valid"] = False
-        write_json(directory / "profiler_index.json", profile)
+        if selected:
+            write_jsonl(directory / "module_shapes.jsonl", shape_records)
+            expected = cfg["profile"]["active_steps"] * len(trajectory)
+            if profile_error:
+                profile = {"valid": False, "status": "FAILED", "error": profile_error, "expected_active_forwards": expected}
+            else:
+                # Raw traces stay on disk; parsing is deferred to offline analysis.
+                profile = {
+                    "valid": None,
+                    "status": "COLLECTED",
+                    "expected_active_forwards": expected,
+                    "note": "offline parsing pending",
+                }
+            write_json(directory / "profiler_index.json", profile)
     for handle in handles:
         handle.remove()
     write_json(

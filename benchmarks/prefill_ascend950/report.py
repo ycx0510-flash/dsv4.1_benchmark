@@ -69,7 +69,10 @@ def aggregate(case: dict, cfg: dict, ranks: list[dict]) -> dict:
     stats = distribution(times)
     tokens = case["global_batch_size"] * case["new_tokens_per_request"] * len(times)
     seconds = sum(times) / 1000
-    profile_ok = not cfg["profile"]["enabled"] or all(r["profile"]["valid"] for r in ranks)
+    profile_statuses = [r.get("profile", {}).get("status") for r in ranks]
+    profile_ok = not cfg["profile"]["enabled"] or (
+        all(status in ("COLLECTED", "SKIPPED") for status in profile_statuses) and "COLLECTED" in profile_statuses
+    )
     graph_ok = not cfg["alignment"]["enabled"] or all(r["graph_alignment"]["match"] for r in ranks)
     load = [r["expert_assignments"] for r in ranks]
     result = dict(case)
