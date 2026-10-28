@@ -56,6 +56,10 @@ DEFAULTS = {
         "enabled": True,
         # Only rank 0 is profiled by default; all ranks still run the same steps.
         "ranks": "rank0",
+        # ranks selects who runs the profiler (all ranks keeps CP collection stable);
+        # export_ranks selects whose traces are written. Non-exporting ranks record
+        # into a scratch directory that is deleted after the profiling pass.
+        "export_ranks": "rank0",
         "level": "Level1",
         # wait + warmup + active = number of forward calls in the profiling pass.
         "wait_steps": 0,
@@ -209,6 +213,8 @@ def resolve(raw: dict) -> dict:
         raise ValueError("Only native_model_forward timing is supported")
     if prof["ranks"] not in ("all", "rank0") or prof["level"] not in ("Level0", "Level1", "Level2"):
         raise ValueError("Profile requires ranks all/rank0 and Level0/Level1/Level2")
+    if prof["export_ranks"] not in ("all", "rank0"):
+        raise ValueError("Profile export_ranks must be all/rank0")
     for key in ("wait_steps", "warmup_steps", "active_steps"):
         integer(prof[key], f"profile.{key}", 1 if key == "active_steps" else 0)
     return cfg

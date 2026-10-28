@@ -374,7 +374,7 @@ OOM、PATH_MISMATCH、INVALID_CONFIG、PROFILE_FAILED、TIMEOUT和UNSUPPORTED点
 
 ## 10. profiling契约
 
-使用目标torch_npu的CPU+NPU profiler，独立profile pass默认只采 rank0（`profile.ranks=rank0`，设为 `all` 才全采）；采集阶段不解析trace，解析留到离线（`profiler.save_profile_index`）。profiling pass采用连续批执行：批前只restore并同步一次，中间不插入synchronize/barrier/restore，避免两次forward之间出现设备空泡；`profiler.step()`只做host侧步进。`profile.continuous=false` 可回退为每个profiled forward前restore+同步的旧式采集：连续模式在CP2 + 256K/0.97上实测触发device error 507035（vector core exception，kernel不固定），同步模式可稳定采集；该开关只影响profiling采集，不影响timing。不沿用只能采driver的HTTP profiler。优先标准`torch_npu.profiler`接口，能力预检检测目标版本支持的活动、级别、schedule和导出函数，不在模块import时假定私有experimental字段一定存在。[R10]
+使用目标torch_npu的CPU+NPU profiler，独立profile pass默认只采 rank0（`profile.ranks=rank0`，设为 `all` 才全采）；采集阶段不解析trace，解析留到离线（`profiler.save_profile_index`）。profiling pass采用连续批执行：批前只restore并同步一次，中间不插入synchronize/barrier/restore，避免两次forward之间出现设备空泡；`profiler.step()`只做host侧步进。`profile.continuous=false` 可回退为每个profiled forward前restore+同步的旧式采集：连续模式在只采rank0时对CP2 + 256K/0.97实测触发device error 507035（vector core exception，kernel不固定），原因是profiler开销只压在rank0、CP/MoE集合通信错位。稳定方案为 `profile.ranks=all` + `profile.export_ranks=rank0`：所有rank对称运行profiler，仅rank0导出trace，其余rank的采集写入`profiler_discard`临时目录并在结束后删除；实测forward间设备空隙0.2–0.6ms，同步式约66ms。这些开关只影响profiling采集，不影响timing。不沿用只能采driver的HTTP profiler。优先标准`torch_npu.profiler`接口，能力预检检测目标版本支持的活动、级别、schedule和导出函数，不在模块import时假定私有experimental字段一定存在。[R10]
 
 默认profile preset：Level1、ranks=rank0、wait=0、warmup=0、active=3、record_shapes=true、with_stack=false、profile_memory=false，即 profiling pass 共 3 次 forward。所有rank执行相同step计划，仅选中rank记录trace；不使用同一个输出文件名。性能量化完全来自关闭profiler的timing pass。
 

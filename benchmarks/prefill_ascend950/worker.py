@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -426,6 +427,10 @@ def _run(
         profile = {"valid": None, "status": "DISABLED"}
         if cfg["profile"]["enabled"]:
             selected = cfg["profile"]["ranks"] == "all" or rank == 0
+            # Recording on every rank keeps the profiler overhead symmetric (required
+            # for stable CP2 collection), but only export_ranks keep their traces.
+            export_trace = cfg["profile"]["export_ranks"] == "all" or rank == 0
+            profiler_directory = rank_directory / ("profiler" if export_trace else "profiler_discard")
             state["profiling"] = selected
             profile = {"valid": None, "status": "SKIPPED", "rank": rank}
             shape_handles = []
@@ -433,7 +438,7 @@ def _run(
             if selected:
                 shape_handles = [module.register_forward_pre_hook(shape_hook(name)) for name, module in model.named_modules()]
                 try:
-                    profiler = create_profiler(rank_directory / "profiler", cfg["profile"], rank)
+                    profiler = create_profiler(profiler_directory, cfg["profile"], rank)
                     profiler.start()
                 except Exception as error:
                     profile_error = f"{type(error).__name__}: {error}"
@@ -457,7 +462,11 @@ def _run(
             shape_gate["active"] = False
             for shape_handle in shape_handles:
                 shape_handle.remove()
-            if selected:
+            if not export_trace:
+                # The discarded recording exists only to keep profiling overhead
+                # symmetric across ranks; never leave its trace on disk.
+                shutil.rmtree(profiler_directory, ignore_errors=True)
+            if export_trace:
                 write_jsonl(rank_directory / "module_shapes.jsonl", shape_records)
                 expected = cfg["profile"]["active_steps"] * len(trajectory)
                 if profile_error:
