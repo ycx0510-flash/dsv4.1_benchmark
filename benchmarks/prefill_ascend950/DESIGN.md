@@ -341,6 +341,8 @@ chunked_suffix: T = Σ_j t[j] = max_r span[r] / iterations
 
 批内不插入同步；host 侧 metadata 构造与下发若无法被异步队列掩盖，会以设备空闲形式计入批跨度，这是连续 forward 的真实成本，不是线上TTFT。禁止把它与 engine.step wall 直接比较。
 
+首个 forward 的 metadata 在 start event 之前构造：256K prompt 的 `SequenceData`（raw + compressed）构造约 31–33ms，只会出现在 profiling trace 起始处，不计入批跨度。
+
 ### 9.2 统计和吞吐
 
 报告mean、p50、p95、p99、min、max、标准差、CV。批计时下所有样本等于批平均，因此 p50=p95=mean、CV=0；保留 raw samples 与 quantile 算法，sample 少时不声称可靠 p99。主吞吐用总工作量除总计时时间，不平均每步token/s：
