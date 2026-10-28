@@ -146,6 +146,18 @@ def rank_errors(directory: Path) -> list[dict]:
     return errors
 
 
+def case_finished(directory: Path) -> tuple[bool, bool]:
+    """(every rank finished, every rank produced a measured outcome).
+
+    A case skipped in-process after a recoverable preparation failure leaves a
+    skipped.json on every rank instead of outcome.json; from the launcher's point
+    of view the case is finished and must not trigger a model reload.
+    """
+    outcomes = [(directory / f"rank_{rank}" / "outcome.json").exists() for rank in range(8)]
+    skips = [(directory / f"rank_{rank}" / "skipped.json").exists() for rank in range(8)]
+    return all(done or skipped for done, skipped in zip(outcomes, skips)), all(outcomes)
+
+
 def error_result(case: dict, directory: Path, status: str, error: str, wall_seconds: float | None = None) -> dict:
     errors = rank_errors(directory)
     if any(item.get("status") == "OOM" for item in errors):
@@ -266,9 +278,27 @@ def watch_group(
     progress.start_case(pending[index][1].name)
     while True:
         case, directory = pending[index]
-        if all((directory / f"rank_{rank}" / "outcome.json").exists() for rank in range(8)):
+        finished, measured = case_finished(directory)
+        if finished:
             case_seconds = time.monotonic() - current_started
-            result = aggregate_case(cfg, case, directory, case_seconds)
+            if measured:
+                result = aggregate_case(cfg, case, directory, case_seconds)
+            else:
+                # Every rank skipped this case in-process after agreeing that
+                # preparation failed before the first collective. The model and
+                # its workspaces are still valid, so continue in the same group.
+                errors = rank_errors(directory)
+                detail = "; ".join(
+                    f"rank {item.get('rank')}: {item.get('type', 'Error')}: {str(item.get('error', ''))[:200]}"
+                    for item in errors
+                ) or "no rank reported a preparation error"
+                result = error_result(
+                    case,
+                    directory,
+                    "FAILED",
+                    f"Skipped in-process after a recoverable preparation failure: {detail}",
+                    case_seconds,
+                )
             index += 1
             if index == len(pending):
                 deadline = time.monotonic() + STOP_GRACE_SECONDS
@@ -383,7 +413,9 @@ def execute_group(
         remaining = remaining[index + 1 :]
 
 
-def run_batch(cfg: dict, cases: list[dict], devices: list[int], model_dir: Path, output: Path, resume: bool) -> int:
+def run_batch(
+    cfg: dict, cases: list[dict], devices: list[int], model_dir: Path, output: Path, resume: bool, skip_failed: bool
+) -> int:
     progress = Progress(len(cases))
     for case in cases:
         if case["status"] == "PLANNED":
@@ -404,10 +436,14 @@ def run_batch(cfg: dict, cases: list[dict], devices: list[int], model_dir: Path,
             existing = find_case_directory(output, case["case_id"]) if resume else None
             if existing is not None:
                 result_path = existing / "result.json"
-                if result_path.exists() and json.loads(result_path.read_text(encoding="utf-8")).get("status") == "OK":
-                    progress.note(f"[{progress.completed + 1}/{progress.total}] {existing.name} already OK")
-                    progress.advance("OK")
-                    continue
+                if result_path.exists():
+                    previous_status = json.loads(result_path.read_text(encoding="utf-8")).get("status", "FAILED")
+                    if previous_status == "OK" or skip_failed:
+                        progress.note(
+                            f"[{progress.completed + 1}/{progress.total}] {existing.name} already {previous_status}"
+                        )
+                        progress.advance(previous_status)
+                        continue
                 # Preserve failed attempts; never mix stale rank outcomes with a new run.
                 previous = output / "attempts" / f"{existing.name}-{time.time_ns()}"
                 previous.parent.mkdir(parents=True, exist_ok=True)
@@ -428,7 +464,7 @@ def run_batch(cfg: dict, cases: list[dict], devices: list[int], model_dir: Path,
     return progress.failed
 
 
-def run(cfg: dict, devices: list[int], model_dir: Path, output: Path, resume: bool = False) -> dict:
+def run(cfg: dict, devices: list[int], model_dir: Path, output: Path, resume: bool = False, skip_failed: bool = False) -> dict:
     output = output.resolve()
     if output.exists() and not resume:
         raise ValueError("Output directory already exists; choose a new directory or use --resume")
@@ -451,17 +487,21 @@ def run(cfg: dict, devices: list[int], model_dir: Path, output: Path, resume: bo
         write_jsonl(output / "cases.jsonl", cases)
         failed = 0
         if cfg["batch"]["enabled"]:
-            failed = run_batch(cfg, cases, devices, model_dir.resolve(), output, resume)
+            failed = run_batch(cfg, cases, devices, model_dir.resolve(), output, resume, skip_failed)
         else:
             progress = Progress(len(cases))
             for case in cases:
                 existing = find_case_directory(output, case["case_id"]) if resume else None
                 if existing is not None:
                     result_path = existing / "result.json"
-                    if result_path.exists() and json.loads(result_path.read_text(encoding="utf-8")).get("status") == "OK":
-                        progress.note(f"[{progress.completed + 1}/{progress.total}] {existing.name} already OK")
-                        progress.advance("OK")
-                        continue
+                    if result_path.exists():
+                        previous_status = json.loads(result_path.read_text(encoding="utf-8")).get("status", "FAILED")
+                        if previous_status == "OK" or skip_failed:
+                            progress.note(
+                                f"[{progress.completed + 1}/{progress.total}] {existing.name} already {previous_status}"
+                            )
+                            progress.advance(previous_status)
+                            continue
                     # Preserve failed attempts; never mix stale rank outcomes with a new run.
                     previous = output / "attempts" / f"{existing.name}-{time.time_ns()}"
                     previous.parent.mkdir(parents=True, exist_ok=True)

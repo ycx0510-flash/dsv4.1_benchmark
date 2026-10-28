@@ -23,9 +23,24 @@ class NativePathMismatch(RuntimeError):
 
 
 def _error_status(error: BaseException) -> str:
-    if "out of memory" in str(error).lower() or "OutOfMemory" in type(error).__name__:
+    text = str(error).lower()
+    if "out of memory" in text or "insufficient_device_memory" in text or "outofmemory" in type(error).__name__.lower():
         return "OOM"
     return "PATH_MISMATCH" if isinstance(error, NativePathMismatch) else "FAILED"
+
+
+def _recoverable(error: BaseException) -> bool:
+    """Whether a pre-forward failure can be skipped without rebuilding the model.
+
+    Cache allocation and seeding touch only local device memory, so an HBM shortage
+    there leaves the process group healthy. Kernel/device/HCCL faults give no such
+    guarantee and must reload the whole rank group.
+    """
+    text = str(error).lower()
+    if "out of memory" in text or "insufficient_device_memory" in text or "outofmemory" in type(error).__name__.lower():
+        return True
+    fatal = ("acl runtime exception", "npu function error", "device error", "hccl", "hccp", "vector core")
+    return not any(marker in text for marker in fatal)
 
 
 def entry(
@@ -111,6 +126,9 @@ def _run(
     # Diagnostic hook: force selected case_ids to fail so the launcher's
     # failure-continuation path can be exercised on demand.
     forced_failures = {item.strip() for item in os.environ.get("PREFILL950_FAIL_CASE", "").split(",") if item.strip()}
+    forced_recoverable = {
+        item.strip() for item in os.environ.get("PREFILL950_FAIL_CASE_RECOVERABLE", "").split(",") if item.strip()
+    }
     batch = cases[0]["per_dp_batch_size"]
     # The model is built once for the largest capacity in this group; smaller
     # cases reuse the same workspaces. Communication buffers scale with this
@@ -198,9 +216,21 @@ def _run(
 
     handles = [model.register_forward_pre_hook(before), model.register_forward_hook(after)]
 
+    def release_case_memory() -> None:
+        """Drop per-case references so the next case starts from a clean allocator."""
+        current["state"] = None
+        worker.cache_engine = worker.gpu_cache = None
+        torch.npu.empty_cache()
+        gc.collect()
+
     @torch.inference_mode()
-    def run_case(case: dict, directory: Path) -> None:
-        """Build per-case cache/metadata, measure and profile, then release them."""
+    def run_case(case: dict, directory: Path) -> bool:
+        """Build per-case cache/metadata, measure and profile, then release them.
+
+        Returns False when all ranks agreed to skip the case in-process: preparation
+        failed before the case's first collective, so the loaded model and its
+        communication workspaces stay valid for the remaining cases.
+        """
         rank_directory = directory / f"rank_{rank}"
         rank_directory.mkdir(parents=True, exist_ok=True)
         if len(cases) > 1:
@@ -210,31 +240,108 @@ def _run(
         current["state"] = state
 
         case_batch = case["per_dp_batch_size"]
-        cache = CacheEngine(cache_cfg, model.cfg, case_batch, num_gpu_blocks=case["logical_cache_blocks"])
-        worker.cache_engine, worker.gpu_cache = cache, cache.gpu_cache
-        seeded = seed_cache(cache, case, cfg["runtime"]["seed"], mapping["dp_rank"] * case_batch)
-        snapshot = StateSnapshot(cache)
-        write_json(
-            rank_directory / "native_contract.json",
-            {
-                "rank_mapping": mapping,
-                "model_class": type(model).__name__,
-                "branches": branches,
-                "cache": seeded,
-                "max_num_batched_tokens": capacity,
-                "case_max_rows_per_rank": case["max_rows_per_rank"],
-                "max_num_seqs": batch,
-                "runtime_max_model_len": model_cfg.runtime_max_model_len,
-                "model_cfg": json.loads(json.dumps(model_cfg.model_cfg, default=str)),
-                "environment": native_environment(cfg),
-            },
-        )
-        sequences = (
-            NativeSequences(case, cfg["runtime"]["seed"], mapping["dp_rank"] * case_batch) if mapping["cp_rank"] == 0 else None
-        )
-        trajectory = list(steps(case))
-        chunks = len(trajectory)
-        start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+        # Everything below is local per-case preparation: cache allocation and seeding
+        # touch only this rank's HBM and never enter an HCCL collective. A failure
+        # here is therefore recoverable at case granularity.
+        cache: Any = None
+        snapshot: Any = None
+        sequences: Any = None
+        trajectory: list = []
+        failed: BaseException | None = None
+        try:
+            cache = CacheEngine(cache_cfg, model.cfg, case_batch, num_gpu_blocks=case["logical_cache_blocks"])
+            worker.cache_engine, worker.gpu_cache = cache, cache.gpu_cache
+            seeded = seed_cache(cache, case, cfg["runtime"]["seed"], mapping["dp_rank"] * case_batch)
+            snapshot = StateSnapshot(cache)
+            write_json(
+                rank_directory / "native_contract.json",
+                {
+                    "rank_mapping": mapping,
+                    "model_class": type(model).__name__,
+                    "branches": branches,
+                    "cache": seeded,
+                    "max_num_batched_tokens": capacity,
+                    "case_max_rows_per_rank": case["max_rows_per_rank"],
+                    "max_num_seqs": batch,
+                    "runtime_max_model_len": model_cfg.runtime_max_model_len,
+                    "model_cfg": json.loads(json.dumps(model_cfg.model_cfg, default=str)),
+                    "environment": native_environment(cfg),
+                },
+            )
+            sequences = (
+                NativeSequences(case, cfg["runtime"]["seed"], mapping["dp_rank"] * case_batch)
+                if mapping["cp_rank"] == 0
+                else None
+            )
+            trajectory = list(steps(case))
+            if sequences is not None:
+                # Validate native metadata construction before the first collective;
+                # a systematic host-side metadata error is then skippable as well.
+                probe = sequences.metadata(trajectory[0])
+                del probe
+            if case["case_id"] in forced_recoverable:
+                # Diagnostic: fail at the end of preparation, after the per-case
+                # cache and native metadata exist, to exercise the real release path.
+                raise RuntimeError(f"forced recoverable failure (PREFILL950_FAIL_CASE_RECOVERABLE): {case['case_id']}")
+            chunks = len(trajectory)
+            start, end = torch.npu.Event(enable_timing=True), torch.npu.Event(enable_timing=True)
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            failed = error
+            traceback.print_exc()
+            write_json(
+                rank_directory / "error.json",
+                {
+                    "rank": rank,
+                    "case_id": case["case_id"],
+                    "type": type(error).__name__,
+                    "error": str(error),
+                    "traceback": traceback.format_exc(),
+                    "status": _error_status(error),
+                },
+            )
+            print(f"rank {rank}: case preparation failed: {type(error).__name__}: {error}", flush=True)
+            cache = snapshot = sequences = None
+            trajectory = []
+            release_case_memory()
+        # A rank that failed preparation cannot join this case's HCCL collectives, so
+        # all ranks decide together before the first forward: 0 = proceed, 1 = skip
+        # the case in-process, 2 = fatal (tear the group down and reload the model).
+        failure_status = _error_status(failed) if failed is not None else None
+        fatal_here = failed is not None and not _recoverable(failed)
+        flag = torch.tensor([0 if failed is None else (2 if fatal_here else 1)], dtype=torch.int32, device="cpu")
+        if failed is not None and not fatal_here:
+            # Traceback frames can pin partially allocated cache tensors; dropping
+            # the recoverable exception lets the next case reuse that memory.
+            failed = None
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        decision = int(flag.item())
+        if decision == 2:
+            # Device/communication faults may leave the group unusable; never write
+            # a skip marker here or the launcher would keep the group. The process
+            # is about to exit, so the driver reclaims the device memory.
+            if fatal_here:
+                assert failed is not None
+                raise failed
+            raise RuntimeError(f"fatal case preparation failure on a peer rank: {case['case_id']}")
+        if decision == 1:
+            # Peer ranks prepared successfully; drop those references before the
+            # allocator flush so the skipped case's HBM is actually returned.
+            cache = snapshot = sequences = None
+            trajectory = []
+            release_case_memory()
+            write_json(
+                rank_directory / "skipped.json",
+                {
+                    "rank": rank,
+                    "case_id": case["case_id"],
+                    "decision": decision,
+                    "reason": "preparation_failure" if failure_status is not None else "peer_preparation_failure",
+                },
+            )
+            print(f"rank {rank}: case skipped after a recoverable preparation failure", flush=True)
+            return False
 
         @torch.inference_mode()
         def run_trajectory(iteration: int = 0) -> None:
@@ -495,11 +602,9 @@ def _run(
         )
         sys.stdout.flush()
         # Release per-case device memory before the next case; the model stays.
-        current["state"] = None
         del cache, snapshot, sequences, trajectory
-        worker.cache_engine = worker.gpu_cache = None
-        torch.npu.empty_cache()
-        gc.collect()
+        release_case_memory()
+        return True
 
     write_json(
         group_dir / f"ready_rank_{rank}.json",
@@ -523,7 +628,7 @@ def _run(
             try:
                 if case["case_id"] in forced_failures:
                     raise RuntimeError(f"forced case failure (PREFILL950_FAIL_CASE): {case['case_id']}")
-                run_case(case, directory)
+                completed = run_case(case, directory)
             except BaseException as error:
                 traceback.print_exc()
                 write_json(
@@ -539,6 +644,8 @@ def _run(
                 )
                 print(f"rank {rank}: case {index} failed: {type(error).__name__}: {error}", flush=True)
                 raise
+            if not completed:
+                print(f"rank {rank}: case {index} skipped, loaded model reused for the next case", flush=True)
             dist.barrier()  # keep ranks in lockstep before the next case
     finally:
         for handle in handles:

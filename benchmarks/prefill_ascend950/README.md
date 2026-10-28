@@ -213,9 +213,9 @@ fixed_global适合比较相同总工作量的延迟和吞吐。fixed_per_dp时�
 
 模型构建时 `max_num_batched_tokens` 会按 token 数预分配通信 workspace（实测约 128 KB/token，7936 token ≈ 0.95 GiB SymmBuffer），因此不能按整个扫描的最大 L 只加载一次：1M/低命中 case 的容量会拖垮全部 case。默认 `batch.capacity_grouping=power2`，按每个 case 需要的 `max_rows_per_rank` 向上取 2 的幂分桶，每组只在同一 2× 容量带内加载；`single` 表示每策略只按最大容量加载（可能 OOM）。完整扫描示例见 `configs/sweep_v41_full.json`（20 个 L × 11 个命中率，220 个 case 分为 13 组、共 13 次加载）。
 
-容错：某个 case 在任一 rank 抛错（含 OOM）时，该 rank 写 `rank_*/error.json` 后退出；launcher 终止本组进程、把该 case 标为 FAILED/OOM，然后用剩余 case 重新加载并继续，不会中断整个扫描。整组模型加载失败时只把该组剩余 case 标为 FAILED 并继续下一组，不会影响其他容量带。每个 case 仍受 `runtime.case_timeout_s` 限制。
+容错分两级。**可恢复失败**只发生在该 case 的任何集合通信之前，即 per-case 准备阶段：`CacheEngine` 分配 OOM、`seed_cache` 失败、首个原生 metadata 构造失败。失败 rank 写 `rank_*/error.json`；随后 8 个 rank 用 Gloo `all_reduce(max)` 协商（0=继续，1=可恢复跳过，2=致命），全组一致后各写 `rank_*/skipped.json` 并直接执行下一个 case，**模型与通信 workspace 不重新加载**，launcher 把该 case 标为 FAILED/OOM 后在同一进程组继续。**致命失败**发生在 forward/集合通信中（device error 507035、HCCL 错误等），或准备阶段出现非内存类 device/kernel 错误：进程退出，launcher 终止整组、把该 case 标为 FAILED，再用剩余 case 重新加载继续。整组模型加载失败时只把该组剩余 case 标为 FAILED 并继续下一组，不会影响其他容量带。每个 case 仍受 `runtime.case_timeout_s` 限制。诊断时可用 `PREFILL950_FAIL_CASE=<case_id>` 注入致命失败、`PREFILL950_FAIL_CASE_RECOVERABLE=<case_id>` 注入可恢复失败。
 
-进度：终端为 TTY 时在 stdout 显示原地刷新的进度条 `[████░░…] 已完成/总数 ok=… failed=… | 当前 case`，模型加载时显示 `loading model (capacity=…)`；重定向到文件/管道时退化为逐行 `running`/`OK`/`FAILED` 输出。每组开始时打印 `loading model ... capacity=...` 和加载耗时。组级日志与 `ready_rank_*.json` 在 `groups/<strategy>_cap<capacity>_<stamp>/`，case 结果目录结构不变。`max_cases_per_group` 可限制单组 case 数（0 表示不限制），CLI 可用 `--batch-cases/--no-batch-cases` 覆盖开关。诊断时可用 `PREFILL950_FAIL_CASE=<case_id>[,<case_id>]` 注入 case 失败，验证失败续跑。
+进度：终端为 TTY 时在 stdout 显示原地刷新的进度条 `[████░░…] 已完成/总数 ok=… failed=… | 当前 case`，模型加载时显示 `loading model (capacity=…)`；重定向到文件/管道时退化为逐行 `running`/`OK`/`FAILED` 输出。每组开始时打印 `loading model ... capacity=...` 和加载耗时。组级日志与 `ready_rank_*.json` 在 `groups/<strategy>_cap<capacity>_<stamp>/`，case 结果目录结构不变。`max_cases_per_group` 可限制单组 case 数（0 表示不限制），CLI 可用 `--batch-cases/--no-batch-cases` 覆盖开关。
 
 ## Profiling与结果目录
 
@@ -237,6 +237,7 @@ results/<run_id>/
     rank_0/ ... rank_7/
       worker.log / native_contract.json
       samples.jsonl / outcome.json / module_shapes.jsonl
+      error.json / skipped.json   # 跳过的 case：失败 rank 写 error，其余 rank 写 skipped
       graph_signature_0.json / graph_signature_1.json
       profiler_index.json         # 仅选中 rank（默认 rank0），采集后 status=COLLECTED
       profiler/...                # 原生 Ascend trace/summary，仅选中 rank
@@ -248,7 +249,7 @@ results/<run_id>/
 
 每个 case 独立启动八进程，复用原生 PG/rank 映射和 CP metadata 广播；CP follower 进入同步 benchmark 循环。模型加载、准备和退出都不计入 forward 时延。这样隔离 buffer/state，代价是扫描启动较慢。
 
-OOM、单 rank 异常或超时会终止整组，继续后续 case。profile 缺失、缺少实际 NPU kernel 或 active forward 范围不完整时保留 timing 并标记 `timing_ok_profile_failed`，整次 collect 非零退出。结果写入采用临时文件原子替换。`--resume` 仅在 manifest 完全一致时跳过成功点；失败点整 case 重跑，原尝试移到 `attempts/`。
+可恢复准备失败会在组内跳过该 case；致命 OOM、单 rank 异常或超时会终止整组，继续后续 case。profile 缺失、缺少实际 NPU kernel 或 active forward 范围不完整时保留 timing 并标记 `timing_ok_profile_failed`，整次 collect 非零退出。结果写入采用临时文件原子替换。`--resume` 仅在 manifest 完全一致时跳过成功点；失败点整 case 重跑，原尝试移到 `attempts/`。加 `--skip-failed` 时，已有任何结果（含 FAILED/OOM）都视为已完成、不再重跑，适合“先采完部分策略、再用同一 run 目录继续其余策略”。
 
 `peak_torch_*` 是 allocator 峰值；`minimum_device_free_bytes` 是准备后及每次 forward 后的设备空闲显存最小采样，包含持久非 torch 分配，不能当作连续 HBM 峰值。准备峰值、原生 KV/state 字节数和快照大小另存在 rank outcome 中。容量规划仅给出 block KV 下界，不保证完整模型能运行该点。
 

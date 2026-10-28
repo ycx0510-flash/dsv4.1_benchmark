@@ -37,6 +37,11 @@ def parser() -> argparse.ArgumentParser:
         if name == "run":
             command.add_argument("--resume", action="store_true")
             command.add_argument(
+                "--skip-failed",
+                action="store_true",
+                help="With --resume, keep cases whose previous result was not OK instead of retrying them",
+            )
+            command.add_argument(
                 "--batch-cases",
                 action=argparse.BooleanOptionalAction,
                 default=None,
@@ -100,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run":
             from .launcher import run
 
-            result = run(cfg, args.devices, args.model_dir, args.out, args.resume)
+            result = run(cfg, args.devices, args.model_dir, args.out, args.resume, args.skip_failed)
             print(json.dumps(result, indent=2))
             return int(not result["ok"])
         if args.command == "summarize":

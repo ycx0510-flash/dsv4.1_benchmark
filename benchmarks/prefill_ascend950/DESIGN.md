@@ -205,7 +205,7 @@ hook内不做synchronize、barrier、日志落盘或CPU读取tensor；这些操�
 
 模型构建时的 `max_num_batched_tokens` 决定通信 workspace 规模（实测约 128 KB/token），所以分组按 case 需要的 `max_rows_per_rank` 取 2 的幂分桶（`capacity_grouping=power2`），每组容量取组内最大；`single` 为每策略一次加载（大 L 低命中会 OOM，整组失败）。这样“一次加载”不会用一个 1M case 的容量拖垮全部 case。
 
-失败语义：launcher 只从 8 个 rank 的 `outcome.json` 聚合结果，任一 rank 失败时该 case 不会被发布。case 级失败（含 OOM/超时）终止本组进程，把当前 case 标为 FAILED/OOM/TIMEOUT/INCOMPLETE，然后用剩余 case 重新加载继续；组内模型加载失败则只把该组剩余 case 标为 FAILED，继续下一组。`runtime.case_timeout_s` 按 case 计时（从上一个 case 完成或模型就绪开始）。进度写 stdout：TTY 下为原地刷新的进度条（已完成/总数、ok/failed、当前 case/模型加载），非 TTY 退化为逐行输出；组日志写 `groups/.../rank_*/worker.log`，`ready_rank_*.json` 用于区分加载失败和 case 失败。
+失败语义分两级。**可恢复失败**限定在 case 的任何集合通信之前：per-case 的 `CacheEngine` 分配 OOM、`seed_cache` 失败、首个原生 metadata 构造失败。这些操作只碰本 rank 的 HBM，不进入 HCCL，因此进程组仍然健康。失败 rank 写 `rank_*/error.json`，随后八个 rank 用 Gloo `all_reduce(MAX)` 对标志位协商（0=全部就绪，1=可恢复跳过，2=致命）；因为失败的 rank 无法加入本 case 后续的 HCCL 集合通信，协商必须发生在第一次 forward 之前。标志为 1 时每个 rank 写 `skipped.json`（失败 rank 同时保留 error.json），launcher 用 `outcome.json ∥ skipped.json` 判定 case 已完成，按 rank error 把 case 标为 FAILED/OOM 并在**同一进程组**继续下一个 case，模型、Engram buffer 与通信 workspace 不重载；失败 rank 的异常 traceback 会在协商前丢弃，避免其栈帧钉住已分配的 cache tensor。**致命失败**是 forward/集合通信中的错误（device error 507035、HCCL 错误等）或准备阶段的非内存类 device/kernel 错误：进程退出，launcher 终止整组、把当前 case 标为 FAILED，然后用剩余 case 重新加载继续；组内模型加载失败则只把该组剩余 case 标为 FAILED，继续下一组。`runtime.case_timeout_s` 按 case 计时（从上一个 case 完成或模型就绪开始）。进度写 stdout：TTY 下为原地刷新的进度条（已完成/总数、ok/failed、当前 case/模型加载），非 TTY 退化为逐行输出；组日志写 `groups/.../rank_*/worker.log`，`ready_rank_*.json` 用于区分加载失败和 case 失败。诊断用 `PREFILL950_FAIL_CASE`（致命）与 `PREFILL950_FAIL_CASE_RECOVERABLE`（可恢复）注入。
 
 ## 6. metadata契约
 
@@ -451,9 +451,9 @@ result区分requested与effective值、测量状态与alignment状态。最小�
 
 `collect.sh --config ... --out ...` 依次 doctor、plan、timing、profile、summarize。首版每个 case 新建独立八 rank 进程组，capacity 使用本 case 的原生 mirror pad 上界和 B_dp×(1+nextn) 下界，避免前一个 case 的大 buffer/state 影响后一个 case。代价是逐点重复加载；加载不计入 forward，case wall 单独记录。
 
-首版不自动降低batch、缩短L、关闭Engram或替换kernel来绕过OOM。控制器记录失败并重启整个8-rank组，再继续后续case；避免一个rank退出后其他rank永久等待collective。每case及启动均有timeout；任何rank失败都使本case失效。
+不自动降低batch、缩短L、关闭Engram或替换kernel来绕过OOM。批量模式下可恢复失败（首个集合通信之前的 cache 分配/造数/metadata 失败）在进程内跳过并保留模型；其余失败仍重启整个8-rank组，再继续后续case，避免一个rank退出后其他rank永久等待collective。每case及启动均有timeout；任何rank失败都使本case失效。
 
-结果使用临时文件写完后 rename，支持 --resume。已有成功点仅在硬件/软件/配置/模型/原生源码 manifest 匹配时复用。失败点当前整 case 重跑，旧目录移入 attempts 保留 timing 和 trace；暂不实现仅重采 profile 的优化。不同 run 不按文件名合并排名。
+结果使用临时文件写完后 rename，支持 --resume。已有成功点仅在硬件/软件/配置/模型/原生源码 manifest 匹配时复用。失败点默认整 case 重跑，旧目录移入 attempts 保留 timing 和 trace；`--skip-failed` 可把已有失败点也视为已完成，用于分策略续采。暂不实现仅重采 profile 的优化。不同 run 不按文件名合并排名。
 
 ## 13. 对齐验证、验收与开发顺序
 
