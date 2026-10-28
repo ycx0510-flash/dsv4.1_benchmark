@@ -219,7 +219,7 @@ fixed_global适合比较相同总工作量的延迟和吞吐。fixed_per_dp时�
 
 默认在独立pass**只采 rank0**（`profile.ranks=rank0`；设为 `all` 才全采），所有 rank 仍执行相同的 profiling steps。采集阶段**不解析** trace：`profiler_index.json` 只记录 `status=COLLECTED` 和 `expected_active_forwards`，解析留到离线（可调用 `profiler.save_profile_index`）。默认 `wait=0, warmup=0, active=3`，即 profiling pass 共 3 次 forward。profiling 不会污染正式 timing samples。
 
-profiling pass 与 timing 一样采用连续批执行：整批开始前只 restore state 并同步一次，3 次 forward 连续下发，中间不插入 `synchronize`/`barrier`/`restore`，避免 trace 中两次 forward 之间出现设备空泡；`profiler.step()` 只做 host 侧步进。
+profiling pass 与 timing 一样采用连续批执行：整批开始前只 restore state 并同步一次，3 次 forward 连续下发，中间不插入 `synchronize`/`barrier`/`restore`，避免 trace 中两次 forward 之间出现设备空泡；`profiler.step()` 只做 host 侧步进。该连续模式（`profile.continuous=true`，默认）在部分原生 CP 形状上不稳定：CP2 + 256K/0.97 实测连续 3 次采集均触发 vector core 异常（device error 507035，出错 kernel 在 `_load_paged_kv_cache_kernel` / `_fused_norm_rope_hadamard_cast_store_kvcache_kernel` 之间漂移）；设 `profile.continuous=false` 改为每个 profiled forward 前 restore+同步后，active=1/3 均能正常产出 trace。该开关只影响 profiling 采集方式，不影响 timing pass。
 
 256K 用例 trace 起始处约 33ms 的空泡来自首个 forward 的 host metadata 构造（raw 与 compressed 两个 262144-token `SequenceData` 各约 15.5ms），发生在 `prefill950:native_model_forward` 范围之外。计时 pass 在 `start.record()` 之前构造首个 metadata，因此该空泡不计入单 forward 平均时延；profiling 开/关的正式 timing 差异在测量噪声内。
 

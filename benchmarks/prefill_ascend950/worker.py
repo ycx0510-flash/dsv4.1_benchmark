@@ -303,6 +303,20 @@ def _run(
             the NPU idle while the host built the next metadata. This mirrors the
             timing batch instead: restore once, then keep enqueueing forwards.
             """
+            if not cfg["profile"]["continuous"]:
+                # Some native CP shapes are unstable under continuous profiling;
+                # fall back to one synchronized trajectory per profiled forward.
+                active_from = cfg["profile"]["wait_steps"] + cfg["profile"]["warmup_steps"]
+                for pindex in range(count):
+                    shape_gate.update(active=selected and pindex >= active_from, pindex=pindex)
+                    run_trajectory(iteration=pindex)
+                    if profiler is not None and error_state["error"] is None:
+                        try:
+                            profiler.step()
+                        except Exception as error:
+                            error_state["error"] = f"{type(error).__name__}: {error}"
+                state["minimum_free"] = min(state["minimum_free"], torch.npu.mem_get_info()[0])
+                return
             with torch.profiler.record_function("prefill950:cache_restore") if state["profiling"] else nullcontext():
                 snapshot.restore()
                 torch.npu.synchronize()  # only once, before the profiled batch

@@ -61,6 +61,10 @@ DEFAULTS = {
         "wait_steps": 0,
         "warmup_steps": 0,
         "active_steps": 3,
+        # Continuous forwards avoid cross-forward device idle but can be
+        # unstable with some native CP shapes; false restores the synchronized
+        # per-trajectory profiling pass.
+        "continuous": True,
         "record_shapes": True,
         "with_stack": False,
         "profile_memory": False,
