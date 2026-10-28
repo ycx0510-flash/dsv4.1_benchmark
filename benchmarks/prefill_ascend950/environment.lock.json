@@ -1,0 +1,18 @@
+{
+  "status": "SOURCE_BASELINE_NOT_A_MEASURED_950_ENVIRONMENT",
+  "python": "3.12",
+  "cann": "9.2.0",
+  "torch": "2.13.0+cpu",
+  "torch_npu": "2.13.0rc1",
+  "tilelang": "0.1.15",
+  "tile-kernels": "2.1.0",
+  "setuptools": "77.0.3",
+  "wheel": "0.45.1",
+  "compiler": "GCC >= 13 with C++20",
+  "requirements": "requirements-ascend.txt (includes requirements-dev.txt and requirements.txt)",
+  "driver_hdk_firmware": "Preinstalled by operator; actual inventory saved by doctor",
+  "distribution_architecture_glibc": "Recorded on target machine",
+  "resolved_lock": "<venv>/prefill950/requirements.resolved.txt",
+  "wheel_and_extension_hashes": "<venv>/prefill950/deployment.json",
+  "container_digest": null
+}

@@ -1,0 +1,72 @@
+diff --git a/deepinfer/environ.py b/deepinfer/environ.py
+index e3a55bb..48f5e45 100644
+--- a/deepinfer/environ.py
++++ b/deepinfer/environ.py
+@@ -20,6 +20,13 @@ def _bool(v: str | None, default: str = "0") -> bool:
+     raise ValueError("expected one of '0', '1', 'false', 'true' (case-insensitive)")
+ 
+ 
++def _engram_force_gpu_storage(v: str | None) -> bool:
++    """Ascend defaults the Engram tables to device memory; an explicit false keeps them on the host."""
++    if v is not None and v.strip().lower() in ("0", "false", "off", "no"):
++        return False
++    return _bool(v) or envs.DEEPINFER_ACCELERATOR == "ascend"
++
++
+ def _int(v: str | None, default: int = 0) -> int:
+     return int(v if v is not None else str(default))
+ 
+@@ -151,7 +158,7 @@ class envs:
+ 
+     # -- Model Loading --
+     DEEPINFER_ENGRAM_PAD_TOKEN = EnvVar.int(default=2)
+-    DEEPINFER_ENGRAM_FORCE_GPU_STORAGE = EnvVar(lambda v: _bool(v) or envs.DEEPINFER_ACCELERATOR == "ascend")
++    DEEPINFER_ENGRAM_FORCE_GPU_STORAGE = EnvVar(_engram_force_gpu_storage)
+ 
+     # -- Sampling --
+     DEEPINFER_SAMPLER_FORCE_TOPK = EnvVar.int()
+diff --git a/deepinfer/model_executor/models/deepseek.py b/deepinfer/model_executor/models/deepseek.py
+index ca31b1c..1c2b915 100644
+--- a/deepinfer/model_executor/models/deepseek.py
++++ b/deepinfer/model_executor/models/deepseek.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import os
+ import time
+ from collections.abc import Sequence
+ from pathlib import Path
+@@ -470,7 +471,14 @@ class DeepseekForCausalLM(nn.Module):
+         started = log_load_phase("plan_build", started)
+ 
+         # Materialize on GPU/CPU, retaining runtime layout metadata and scales.
+-        engram_device = "cuda" if envs.DEEPINFER_ENGRAM_FORCE_GPU_STORAGE else "cpu"
++        # Ascend defaults the load-time Engram tables to the device, which duplicates
++        # the registered EngramBuffer storage. DEEPINFER_ENGRAM_CPU_LOAD=1 keeps the
++        # tables on the host; the device still fetches from the sharded buffer.
++        engram_device = (
++            "cpu"
++            if os.environ.get("DEEPINFER_ENGRAM_CPU_LOAD") == "1"
++            else ("cuda" if envs.DEEPINFER_ENGRAM_FORCE_GPU_STORAGE else "cpu")
++        )
+         materialized_by_name: dict[str, torch.nn.Parameter] = {}
+         for nm, m in gpt.named_modules():
+             for pn, p in m.named_parameters(recurse=False):
+diff --git a/deepinfer/model_executor/models/v4_modules/engram.py b/deepinfer/model_executor/models/v4_modules/engram.py
+index 123f2ac..7406f72 100644
+--- a/deepinfer/model_executor/models/v4_modules/engram.py
++++ b/deepinfer/model_executor/models/v4_modules/engram.py
+@@ -205,7 +205,12 @@ class EngramRuntime:
+         embeddings = [layer.ngram_embedding for layer in self._layers]
+         if self._buffer is None:
+             self._buffer = self.allocate(embeddings)
+-        weights = [cuda_view_for_write(embedding.weight) for embedding in embeddings]
++        # Ascend's EngramBuffer.write copies host tensors directly (H2D); only the
++        # GPU/other backends need the device-pinned view of a CPU table.
++        weights = [
++            embedding.weight if PLATFORM.is_npu and embedding.weight.device.type == "cpu" else cuda_view_for_write(embedding.weight)
++            for embedding in embeddings
++        ]
+         sfs = [embedding.gather_sf() for embedding in embeddings] if embeddings[0].sf is not None else None
+         self._buffer.write(weights, sfs=sfs)
+         for embedding in embeddings:

@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "parallel": {"strategies": ["DP8CP1EP8", "DP4CP2EP8", "DP2CP4EP8", "DP1CP8EP8"], "batch_mode": "fixed_global", "global_batch_size": 8},
+  "workload": {"context_lengths": [8192], "cache_hit_rates": ["0.5"]}
+}

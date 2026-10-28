@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "parallel": {"strategies": ["DP8CP1EP8", "DP4CP2EP8", "DP2CP4EP8", "DP1CP8EP8"], "batch_mode": "fixed_global", "global_batch_size": 8},
+  "workload": {"context_lengths": [8192, 32768, 131072, 524288, 1048576], "cache_hit_rates": ["0", "0.5", "0.9", "0.99"], "execution": "chunked_suffix", "chunk_tokens_per_request": 4096}
+}
