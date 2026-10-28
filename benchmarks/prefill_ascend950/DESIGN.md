@@ -353,6 +353,8 @@ chunked_suffix: T = Σ_j t[j]
 
 首个 forward 的 metadata 在 start event 之前构造：256K prompt 的 `SequenceData`（raw + compressed）构造约 31–33ms，只会出现在 profiling trace 起始处，不计入批跨度。
 
+只取 rank0 的另一个原因是不同 rank 的 span 不可比。首个 forward 的 metadata 在 start event 之前构造：CP driver（rank0）花约 62ms 构造它（每 DP 2 条请求 × raw+compressed `SequenceData`），这段时间被排除在自己的 span 之外；CP follower 的 metadata 为空，`start.record()` 更早生效，但它的第一个 forward 要等 driver 构造完并通过 `_prepare_input_follower` 广播，这段等待落在 follower 自己的 span 内。结果 follower 的 span ≈ driver 的 span + 首个 metadata 构造时间：实测同一 CP 对内 follower 比 driver 高 4.9–7.3ms/forward（49–73ms/批），与 62–65ms 的构造时间吻合；而两者的 batch wall 几乎相同（366.2–368.0ms/forward），profiling trace 中同一 CP 对的设备时间线也几乎一致（如 1033.8 vs 1033.1ms/3 个 forward）。因此不能跨 rank 比较 span；只取 rank0（driver）得到的是“不含首个 metadata 构造等待”的设备受限批平均，而旧的取最大值口径会把 follower 的这段一次性等待摊进每次 forward。
+
 ### 9.2 统计和吞吐
 
 报告mean、p50、p95、p99、min、max、标准差、CV。批计时下所有样本等于批平均，因此 p50=p95=mean、CV=0；保留 raw samples 与 quantile 算法，sample 少时不声称可靠 p99。主吞吐用总工作量除总计时时间，不平均每步token/s：
