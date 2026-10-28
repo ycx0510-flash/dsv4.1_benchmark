@@ -453,7 +453,7 @@ result区分requested与effective值、测量状态与alignment状态。最小�
 
 不自动降低batch、缩短L、关闭Engram或替换kernel来绕过OOM。批量模式下可恢复失败（首个集合通信之前的 cache 分配/造数/metadata 失败）在进程内跳过并保留模型；其余失败仍重启整个8-rank组，再继续后续case，避免一个rank退出后其他rank永久等待collective。每case及启动均有timeout；任何rank失败都使本case失效。
 
-结果使用临时文件写完后 rename，支持 --resume。已有成功点仅在硬件/软件/配置/模型/原生源码 manifest 匹配时复用。失败点默认整 case 重跑，旧目录移入 attempts 保留 timing 和 trace；`--skip-failed` 可把已有失败点也视为已完成，用于分策略续采。暂不实现仅重采 profile 的优化。不同 run 不按文件名合并排名。
+结果使用临时文件写完后 rename，支持 --resume。已有成功点仅在硬件/软件/配置/模型/原生源码 manifest 匹配时复用：config、模型、原生源码、设备列表任一变化直接拒绝；仅环境指纹（shell 环境变量等）漂移时，确认前三者未变后可用 `--accept-environment-drift` 继续，并追加 `environment_drift.jsonl` 记录前后指纹。指纹中的 `LD_LIBRARY_PATH`/`LD_PRELOAD` 先去重，重复 source CANN 环境不会造成漂移。失败点默认整 case 重跑，旧目录移入 attempts 保留 timing 和 trace；`--skip-failed` 可把已有失败点也视为已完成，用于分策略续采。暂不实现仅重采 profile 的优化。不同 run 不按文件名合并排名。
 
 ## 13. 对齐验证、验收与开发顺序
 

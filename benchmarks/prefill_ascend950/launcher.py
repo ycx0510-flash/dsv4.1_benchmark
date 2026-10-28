@@ -20,6 +20,13 @@ from .report import aggregate, summarize
 
 POLL_SECONDS = 0.5
 STOP_GRACE_SECONDS = 15.0
+IDENTITY_KEYS = ("native_source_id", "model_id", "config_hash", "devices", "schema_version")
+
+
+def manifest_drift(old: dict, new: dict) -> tuple[list[str], bool]:
+    """Material identity keys that changed, plus whether the environment fingerprint drifted."""
+    mismatched = [key for key in IDENTITY_KEYS if old.get(key) != new.get(key)]
+    return mismatched, old.get("environment_id") != new.get("environment_id")
 
 
 class Progress:
@@ -464,7 +471,15 @@ def run_batch(
     return progress.failed
 
 
-def run(cfg: dict, devices: list[int], model_dir: Path, output: Path, resume: bool = False, skip_failed: bool = False) -> dict:
+def run(
+    cfg: dict,
+    devices: list[int],
+    model_dir: Path,
+    output: Path,
+    resume: bool = False,
+    skip_failed: bool = False,
+    accept_environment_drift: bool = False,
+) -> dict:
     output = output.resolve()
     if output.exists() and not resume:
         raise ValueError("Output directory already exists; choose a new directory or use --resume")
@@ -479,8 +494,31 @@ def run(cfg: dict, devices: list[int], model_dir: Path, output: Path, resume: bo
             raise ValueError("950 preflight failed: " + "; ".join(doctor["errors"]))
         manifest = {k: doctor[k] for k in ("environment_id", "native_source_id", "model_id")}
         manifest.update(config_hash=digest(cfg), devices=devices, schema_version=1)
-        if old_manifest is not None and old_manifest != manifest:
-            raise ValueError("Resume identity mismatch: configuration, environment, native source or model changed")
+        if old_manifest is not None:
+            mismatched, drifted = manifest_drift(old_manifest, manifest)
+            if mismatched:
+                raise ValueError(f"Resume identity mismatch: {', '.join(mismatched)} changed")
+            if drifted:
+                if not accept_environment_drift:
+                    raise ValueError(
+                        "Resume environment fingerprint drifted: "
+                        f"{old_manifest.get('environment_id')} -> {manifest['environment_id']}; "
+                        "configuration, model, native source and devices still match. "
+                        "Pass --accept-environment-drift to keep the existing results."
+                    )
+                record = {
+                    "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "previous_environment_id": old_manifest.get("environment_id"),
+                    "current_environment_id": manifest["environment_id"],
+                    "note": "Only the environment fingerprint changed; config, model, native source and devices matched.",
+                }
+                with (output / "environment_drift.jsonl").open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+                print(
+                    "WARNING: accepting environment fingerprint drift "
+                    f"{record['previous_environment_id']} -> {record['current_environment_id']}",
+                    flush=True,
+                )
         write_json(output / "manifest.json", manifest)
         write_json(output / "resolved_config.json", cfg)
         cases = plan(cfg)

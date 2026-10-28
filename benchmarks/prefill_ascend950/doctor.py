@@ -17,6 +17,16 @@ from .io_utils import file_hash, write_json
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def unique_path(value: str) -> str:
+    """Drop duplicate search-path entries while keeping the effective resolution order."""
+    seen, items = set(), []
+    for item in value.split(":"):
+        if item not in seen:
+            seen.add(item)
+            items.append(item)
+    return ":".join(items)
+
+
 def command(args: list[str], timeout: int = 60) -> dict:
     try:
         result = subprocess.run(
@@ -248,12 +258,19 @@ def check(cfg: dict, devices: list[int], model_dir: Path, output: Path) -> dict:
     }
     extension_dir = ROOT / "deepinfer" / "_so" / f"ascend-{platform.machine()}"
     environment["native_extension_sha256"] = {p.name: file_hash(p) for p in sorted(extension_dir.glob("*.so"))}
-    environment["runtime_environment"] = {
+    runtime_environment = {
         k: v
         for k, v in os.environ.items()
         if k.startswith(("HCCL_", "HCOMM_", "TASK_QUEUE_", "PYTORCH_NPU_", "TILELANG_", "OMP_"))
         or k in ("LD_LIBRARY_PATH", "LD_PRELOAD", "ASCEND_HOME_PATH", "CXX", "CC")
     }
+    # CANN's set_env.sh is not idempotent: sourcing it again appends duplicate
+    # entries without changing library resolution. Dedupe so the fingerprint is
+    # stable across shells that sourced the environment a different number of times.
+    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
+        if key in runtime_environment:
+            runtime_environment[key] = unique_path(runtime_environment[key])
+    environment["runtime_environment"] = runtime_environment
     version_paths = (Path("/usr/local/Ascend/driver/version.info"), Path("/usr/local/Ascend/firmware/version.info"))
     environment["driver_firmware_version_files"] = {
         str(p): p.read_text(encoding="utf-8", errors="replace") for p in version_paths if p.is_file()

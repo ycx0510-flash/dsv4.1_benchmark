@@ -249,7 +249,9 @@ results/<run_id>/
 
 每个 case 独立启动八进程，复用原生 PG/rank 映射和 CP metadata 广播；CP follower 进入同步 benchmark 循环。模型加载、准备和退出都不计入 forward 时延。这样隔离 buffer/state，代价是扫描启动较慢。
 
-可恢复准备失败会在组内跳过该 case；致命 OOM、单 rank 异常或超时会终止整组，继续后续 case。profile 缺失、缺少实际 NPU kernel 或 active forward 范围不完整时保留 timing 并标记 `timing_ok_profile_failed`，整次 collect 非零退出。结果写入采用临时文件原子替换。`--resume` 仅在 manifest 完全一致时跳过成功点；失败点整 case 重跑，原尝试移到 `attempts/`。加 `--skip-failed` 时，已有任何结果（含 FAILED/OOM）都视为已完成、不再重跑，适合“先采完部分策略、再用同一 run 目录继续其余策略”。
+可恢复准备失败会在组内跳过该 case；致命 OOM、单 rank 异常或超时会终止整组，继续后续 case。profile 缺失、缺少实际 NPU kernel 或 active forward 范围不完整时保留 timing 并标记 `timing_ok_profile_failed`，整次 collect 非零退出。结果写入采用临时文件原子替换。`--resume` 跳过成功点；失败点整 case 重跑，原尝试移到 `attempts/`。加 `--skip-failed` 时，已有任何结果（含 FAILED/OOM）都视为已完成、不再重跑，适合“先采完部分策略、再用同一 run 目录继续其余策略”。
+
+`--resume` 的 manifest 校验分为两组：config、模型、原生源码、设备列表任一变化直接拒绝；仅环境指纹（shell 环境变量等）漂移时可加 `--accept-environment-drift` 继续，launcher 会向 run 目录追加 `environment_drift.jsonl`（前后指纹与时间）后再更新 manifest。环境指纹中的 `LD_LIBRARY_PATH`/`LD_PRELOAD` 会先按首次出现顺序去重，重复 source CANN `set_env.sh` 不再造成指纹漂移。
 
 `peak_torch_*` 是 allocator 峰值；`minimum_device_free_bytes` 是准备后及每次 forward 后的设备空闲显存最小采样，包含持久非 torch 分配，不能当作连续 HBM 峰值。准备峰值、原生 KV/state 字节数和快照大小另存在 rank outcome 中。容量规划仅给出 block KV 下界，不保证完整模型能运行该点。
 

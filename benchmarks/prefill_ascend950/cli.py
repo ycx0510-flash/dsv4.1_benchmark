@@ -42,6 +42,12 @@ def parser() -> argparse.ArgumentParser:
                 help="With --resume, keep cases whose previous result was not OK instead of retrying them",
             )
             command.add_argument(
+                "--accept-environment-drift",
+                action="store_true",
+                help="With --resume, proceed when only the environment fingerprint changed "
+                "(config, model, native source and devices must still match)",
+            )
+            command.add_argument(
                 "--batch-cases",
                 action=argparse.BooleanOptionalAction,
                 default=None,
@@ -105,7 +111,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run":
             from .launcher import run
 
-            result = run(cfg, args.devices, args.model_dir, args.out, args.resume, args.skip_failed)
+            result = run(
+                cfg, args.devices, args.model_dir, args.out, args.resume, args.skip_failed, args.accept_environment_drift
+            )
             print(json.dumps(result, indent=2))
             return int(not result["ok"])
         if args.command == "summarize":
