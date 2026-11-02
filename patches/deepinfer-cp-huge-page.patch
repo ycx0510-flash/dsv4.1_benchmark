@@ -1,0 +1,17 @@
+diff --git a/deepinfer/model_executor/parallel_utils/cp.py b/deepinfer/model_executor/parallel_utils/cp.py
+index 0e13d9e..9b67e9f 100644
+--- a/deepinfer/model_executor/parallel_utils/cp.py
++++ b/deepinfer/model_executor/parallel_utils/cp.py
+@@ -14,7 +14,11 @@ class CPManager:
+     """
+ 
+     def __init__(self, group: dist.ProcessGroup, num_bytes: int) -> None:
+-        self._buffer = BucketBuffer(group, num_bytes, explicitly_destroy=True)
++        # The 1 GiB huge-page pool can be exhausted by the resident Engram storage
++        # and MoE symmetric buffers on 96 GiB cards even when several GiB are free.
++        # HUGE_FIRST uses 2 MiB pages (normal pages as fallback) instead of
++        # requiring contiguous 1 GiB pages, at negligible bandwidth cost.
++        self._buffer = BucketBuffer(group, num_bytes, explicitly_destroy=True, use_huge1g_page=False)
+         self._rank = group.rank()
+         self._size = group.size()
+         self._session: BucketSession | None = None

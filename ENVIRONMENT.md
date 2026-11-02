@@ -30,7 +30,8 @@ DeepInfer 基线：`553741557a57df44a46fb3ab72b6aafeaf945337`（工作区含本�
 
 ## 本地补丁
 
-本存档包含两组补丁（`patches/`）：
+本存档包含三组补丁（`patches/`），均以 DeepInfer 基线
+`553741557a57df44a46fb3ab72b6aafeaf945337` 为前置版本，需全部应用：
 
 1. `deepinfer-engram-cpu-load.patch`
    - `deepinfer/environ.py`：`DEEPINFER_ENGRAM_FORCE_GPU_STORAGE` 支持显式 `0/false/off/no`。
@@ -38,16 +39,28 @@ DeepInfer 基线：`553741557a57df44a46fb3ab72b6aafeaf945337`（工作区含本�
    - `deepinfer/model_executor/models/v4_modules/engram.py`：NPU 上 CPU 权重直接交给 `EngramBuffer.write()`。
 2. `deepep-ascend-engram-cpu-source.patch`
    - `vendor/DeepEP-Ascend/csrc/buffers/engram.hpp`：`write()` 接受 CPU 源，走 `ACL_MEMCPY_HOST_TO_DEVICE`。
+3. `deepinfer-cp-huge-page.patch`
+   - `deepinfer/model_executor/parallel_utils/cp.py`：CP `BucketBuffer` 改用 `use_huge1g_page=False`
+     （`ACL_MEM_MALLOC_HUGE_FIRST`，2 MiB 页）。96 GiB 卡上权重 + Engram GPU storage +
+     DeepGEMM SymmBuffer 会耗尽 1 GiB 连续大页，即使仍有 >10 GiB 空闲，CP2 大容量 case 的
+     1.00 GiB CP buffer 仍会 EL0019；该补丁使 CP buffer 可回退 2 MiB 页。
+   - 纯 Python 改动，无需重编；实测对 CP all-gather/forward 时延影响在噪声内。
 
-应用方式（在 DeepInfer 根目录）：
+应用方式（`<BENCH_REPO>` 是本仓库路径，`<DEEPINFER>` 是 DeepInfer 根目录）：
 
 ```bash
-git apply patches/deepinfer-engram-cpu-load.patch
-git -C vendor/DeepEP-Ascend apply ../dsv4.1_benchmark/patches/deepep-ascend-engram-cpu-source.patch
-# 然后重编 deep_ep：
+cd <DEEPINFER>
+git apply <BENCH_REPO>/patches/deepinfer-engram-cpu-load.patch
+git apply <BENCH_REPO>/patches/deepinfer-cp-huge-page.patch
+git -C vendor/DeepEP-Ascend apply <BENCH_REPO>/patches/deepep-ascend-engram-cpu-source.patch
+
+# 只有 DeepEP 补丁需要重编 wheel：
 cd vendor/DeepEP-Ascend && python setup.py bdist_wheel --dist-dir ../../build/ascend-aarch64/vendor-wheels
 python -m pip install --force-reinstall --no-deps ../../build/ascend-aarch64/vendor-wheels/deep_ep-*.whl
 ```
+
+应用后可先 `git apply --check --reverse` 逐项核对；运行 benchmark 时仍需
+`PREFILL950_ALLOW_LOCAL_SOURCE=1`，doctor 会记录 `local_patch_accepted=true`。
 
 ## JIT 编译器加固
 
@@ -70,8 +83,12 @@ export PREFILL950_JIT_ASCEND_HOME=$PWD/build/prefill950-tools/ascend-toolkit-shi
 
 - `doctor.py`：torch_npu 版本字符串归一化（`2.13.0.rc1` vs `2.13.0rc1`）；新增 `PREFILL950_ALLOW_LOCAL_SOURCE` 记录式放行。
 - `config.py`：新增 `runtime.engram`（默认 true）；`engram=true` 时默认注入 `DEEPINFER_ENGRAM_CPU_LOAD=1`。
-- `worker.py`：dummy 模式传 `skip_load`；按 `runtime.engram` 置空 Engram；JIT shim 环境变量。
+- `worker.py`：dummy 模式传 `skip_load`；按 `runtime.engram` 置空 Engram；JIT shim 环境变量；
+  `PREFILL950_PRINT_FORWARD_SHAPES=1` 时在 profiling forward 前打印 metadata 行数与所选模块输入 shape
+  （rank0 同时镜像到终端，所有 rank 写 `worker.log`）。
 - `alignment.py`：签名时忽略 forward/backward hook 注册表（诊断自身产生的 hook id 会变化）。
 - `README.md`：补充 Engram 开/关与 CPU 暂存说明。
+- `tools/mega_moe_power_probe.py` / `tools/run_mega_moe_power_probe.sh`：MegaMoE 单算子
+  功耗/降频探针（8 卡默认与模型 EP8 同几何；`--num-processes 1` 可单卡冒烟）。
 
 > 注意：本地补丁使 `deepinfer` 跟踪文件与 `vendor/DeepEP-Ascend` 子模块不再是纯净基线。`doctor.json` / `manifest.json` 仍记录文件 SHA256 与子模块 dirty 状态，带补丁的运行不会与干净基线的结果混排。
