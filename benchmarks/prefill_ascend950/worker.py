@@ -18,6 +18,31 @@ from .io_utils import write_json, write_jsonl
 from .planner import case_capacity, steps
 
 
+_TERMINAL_FD: int | None = None
+_PRINT_SHAPE_MODULES = {"model.embed_tokens", "model", "model.layers.0.attn_layernorm", "model.layers.0.mlp"}
+
+
+def _debug_forward(message: str) -> None:
+    """Opt-in forward diagnostic: always worker.log, plus rank0's terminal when available."""
+    print(message, flush=True)
+    if _TERMINAL_FD is not None:
+        try:
+            os.write(_TERMINAL_FD, (message + "\n").encode("utf-8", "replace"))
+        except OSError:
+            pass
+
+
+def _forward_line(case: dict, pindex: int, step: dict) -> str:
+    return (
+        f"[forward] case={case['case_id']} pindex={pindex} chunk={step['chunk']} "
+        f"seqlen_q={step['seqlen_q']} seqlen_k={step['seqlen_k']} "
+        f"producer_rows_per_dp={step['producer_rows_per_dp']} "
+        f"producer_padded_rows_per_rank={step['producer_padded_rows_per_rank']} "
+        f"consumer_rows_per_dp={step['consumer_rows_per_dp']} "
+        f"consumer_padded_rows_per_rank={step['consumer_padded_rows_per_rank']}"
+    )
+
+
 class NativePathMismatch(RuntimeError):
     """The pinned model or repeated native metadata/module path did not match."""
 
@@ -61,6 +86,12 @@ def entry(
     group = Path(group_dir)
     directory = group / f"rank_{mapping['global_rank']}"
     directory.mkdir(parents=True, exist_ok=True)
+    global _TERMINAL_FD
+    if os.environ.get("PREFILL950_PRINT_FORWARD_SHAPES") == "1" and mapping["global_rank"] == 0:
+        try:
+            _TERMINAL_FD = os.dup(1)
+        except OSError:
+            _TERMINAL_FD = None
     with (directory / "worker.log").open("a", encoding="utf-8", buffering=1) as log:
         os.dup2(log.fileno(), 1)
         os.dup2(log.fileno(), 2)
@@ -122,6 +153,7 @@ def _run(
 
     set_pdeathsig()
     rank = mapping["global_rank"]
+    print_forward_shapes = os.environ.get("PREFILL950_PRINT_FORWARD_SHAPES") == "1"
     started = time.monotonic()
     # Diagnostic hook: force selected case_ids to fail so the launcher's
     # failure-continuation path can be exercised on demand.
@@ -350,6 +382,8 @@ def _run(
                 snapshot.restore()
                 torch.npu.synchronize()
             for step in trajectory:
+                if state["profiling"] and print_forward_shapes and rank == 0:
+                    _debug_forward(_forward_line(case, iteration, step))
                 # Construct a new native SequenceMetadata and InputMetadata per call.
                 metadata = sequences.metadata(step) if sequences is not None else None
                 dist.barrier()  # CPU/Gloo coordination, outside both NPU event boundaries.
@@ -432,6 +466,8 @@ def _run(
             for pindex in range(count):
                 shape_gate.update(active=selected and pindex >= active_from, pindex=pindex)
                 for step in trajectory:
+                    if print_forward_shapes and rank == 0:
+                        _debug_forward(_forward_line(case, pindex, step))
                     metadata = sequences.metadata(step) if sequences is not None else None
                     with (
                         torch.profiler.record_function(f"prefill950:case={case['case_id']}:iteration={pindex}:chunk={step['chunk']}")
@@ -528,6 +564,11 @@ def _run(
                 shape_records.append(
                     {"pindex": shape_gate["pindex"], "module": name, "type": type(module).__qualname__, "inputs": inputs}
                 )
+                if print_forward_shapes and rank == 0 and name in _PRINT_SHAPE_MODULES:
+                    _debug_forward(
+                        f"[forward-shapes] pindex={shape_gate['pindex']} module={name} "
+                        f"type={type(module).__qualname__} inputs={json.dumps(inputs, ensure_ascii=False)}"
+                    )
 
             return hook
 

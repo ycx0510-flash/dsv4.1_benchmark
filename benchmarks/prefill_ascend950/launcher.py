@@ -482,7 +482,24 @@ def run(
 ) -> dict:
     output = output.resolve()
     if output.exists() and not resume:
-        raise ValueError("Output directory already exists; choose a new directory or use --resume")
+        # A pre-created but still empty directory is not a conflict: wrappers
+        # legitimately `mkdir -p` the run root before invoking the CLI. Only a
+        # directory that already holds run artifacts would mix results.
+        artifacts = (
+            "manifest.json",
+            "cases.jsonl",
+            "cases",
+            "groups",
+            "doctor",
+            "attempts",
+            "summary.json",
+            "summary.csv",
+        )
+        if any((output / name).exists() for name in artifacts):
+            raise ValueError(
+                "Output directory already exists and contains run artifacts; "
+                "choose a new directory or use --resume"
+            )
     output.mkdir(parents=True, exist_ok=True)
     lock = output / ".running.lock"
     fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
