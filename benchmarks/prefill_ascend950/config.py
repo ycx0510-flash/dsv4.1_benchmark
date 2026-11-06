@@ -128,6 +128,10 @@ def resolve(raw: dict) -> dict:
         if not isinstance(values, dict):
             raise ValueError(f"{section} must be an object")
         allowed = set(DEFAULTS[section]) | ({"per_dp_batch_size"} if section == "parallel" else set())
+        if section == "workload":
+            # Optional explicit case manifest; deliberately not in DEFAULTS so
+            # existing configs keep their historical hash when it is absent.
+            allowed |= {"cases_file"}
         if set(values) - allowed:
             raise ValueError(f"Unknown {section} keys: {sorted(set(values) - allowed)}")
         if section == "parallel" and values.get("batch_mode") == "fixed_per_dp":
@@ -175,6 +179,9 @@ def resolve(raw: dict) -> dict:
             raise ValueError("fixed_per_dp cannot specify global_batch_size")
     else:
         raise ValueError("batch_mode must be fixed_global/fixed_per_dp")
+    cases_file = w.get("cases_file")
+    if cases_file is not None and (not isinstance(cases_file, str) or not cases_file.strip()):
+        raise ValueError("workload.cases_file must be a nonempty path string")
     if not isinstance(w["context_lengths"], list) or not w["context_lengths"]:
         raise ValueError("context_lengths must be a nonempty list")
     for length in w["context_lengths"]:
@@ -223,7 +230,8 @@ def resolve(raw: dict) -> dict:
 
 def load(path: str | Path) -> dict:
     # Preserve decimal spelling across JSON input, including block boundaries.
-    raw = json.loads(Path(path).read_text(encoding="utf-8"), parse_float=str)
+    config_path = Path(path).expanduser().resolve()
+    raw = json.loads(config_path.read_text(encoding="utf-8"), parse_float=str)
     if not isinstance(raw, dict):
         raise ValueError("configuration must be a JSON object")
     # gpu_memory_utilization is an actual floating runtime parameter, not a hit rate.
@@ -231,7 +239,16 @@ def load(path: str | Path) -> dict:
         raw["runtime"]["gpu_memory_utilization"] = float(raw["runtime"]["gpu_memory_utilization"])
     if isinstance(raw.get("moe"), dict) and isinstance(raw["moe"].get("force_imbalance_ratio"), str):
         raw["moe"]["force_imbalance_ratio"] = float(raw["moe"]["force_imbalance_ratio"])
-    return resolve(raw)
+    cfg = resolve(raw)
+    # Resolve an explicit case manifest relative to the config file, so the
+    # config stays usable from any working directory.
+    cases_file = cfg["workload"].get("cases_file")
+    if cases_file:
+        manifest = Path(cases_file).expanduser()
+        if not manifest.is_absolute():
+            manifest = config_path.parent / manifest
+        cfg["workload"]["cases_file"] = str(manifest.resolve())
+    return cfg
 
 
 def native_environment(cfg: dict) -> dict[str, str]:

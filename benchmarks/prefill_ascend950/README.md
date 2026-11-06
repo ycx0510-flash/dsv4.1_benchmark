@@ -161,6 +161,14 @@ L是包含缓存前缀的完整输入长度。h使用[0,1]比例，例如0.9表�
 
 以上片段也能独立作为配置，其他段使用默认值。长 context 且低命中率时显式 chunk，以限制 query 和 MoE workspace；完整 KV 仍可能 OOM。固定每 DP 请求数可直接使用 [configs/fixed_per_dp.json](./configs/fixed_per_dp.json)；两种 batch 模式的字段互斥。
 
+`workload.cases_file` 可指向一个 JSONL 显式点位表；相对路径按配置文件所在目录解析。设置后不再使用 `context_lengths × cache_hit_rates` 笛卡尔积，`context_lengths`/`cache_hit_rates` 仅保留默认值而不参与规划。每行至少包含：
+
+```json
+{"strategy":"DP8CP1EP8","context_length":1024,"hit":0.8}
+```
+
+`strategy` 必须出现在 `parallel.strategies` 中；`hit` 仍走 `normalize_prefix` 的 block-floor 规则。示例见 [configs/bw750_timing.json](./configs/bw750_timing.json) 与 [configs/bw750_cases.jsonl](./configs/bw750_cases.jsonl)。
+
 `max_model_len`默认固定1M，不随每个L自动缩小；它可能影响metadata容量及indexer分块/stride。runtime派生长度、query容量和KV实际分配量都会保存在manifest中。
 
 ## 缓存命中率如何生效

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from decimal import Decimal
+from pathlib import Path
 
 from .config import STRATEGIES, digest, rate
 
@@ -52,51 +54,103 @@ def steps(case: dict) -> Iterator[dict]:
         }
 
 
-def plan(cfg: dict) -> list[dict]:
-    result = []
-    for strategy in cfg["parallel"]["strategies"]:
-        dp, cp, ep = STRATEGIES[strategy]
-        batch = (
-            cfg["parallel"]["global_batch_size"] // dp
-            if cfg["parallel"]["batch_mode"] == "fixed_global"
-            else cfg["parallel"]["per_dp_batch_size"]
+def _case_specs_from_file(cfg: dict, path: str) -> list[tuple[str, int, str]]:
+    """Read explicit (strategy, context_length, hit) rows from a JSONL ledger.
+
+    Unknown extra keys are ignored so a source tag may be kept in the manifest
+    without becoming part of the benchmark case or its config hash.
+    """
+    manifest = Path(path).expanduser()
+    specs: list[tuple[str, int, str]] = []
+    seen: set[tuple[str, int, str]] = set()
+    enabled = set(cfg["parallel"]["strategies"])
+    with manifest.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except ValueError as error:
+                raise ValueError(f"{manifest}:{line_number}: invalid JSON: {error}") from error
+            if not isinstance(item, dict):
+                raise ValueError(f"{manifest}:{line_number}: each line must be a JSON object")
+            for key in ("strategy", "context_length", "hit"):
+                if key not in item:
+                    raise ValueError(f"{manifest}:{line_number}: missing {key!r}")
+            strategy = item["strategy"]
+            length = item["context_length"]
+            if not isinstance(strategy, str) or strategy not in enabled:
+                raise ValueError(f"{manifest}:{line_number}: strategy {strategy!r} is not enabled")
+            if type(length) is not int or length < 1 or length > cfg["runtime"]["max_model_len"]:
+                raise ValueError(f"{manifest}:{line_number}: invalid context_length {length!r}")
+            try:
+                requested = str(rate(item["hit"]))
+            except ValueError as error:
+                raise ValueError(f"{manifest}:{line_number}: invalid hit {item['hit']!r}: {error}") from error
+            key = (strategy, length, requested)
+            if key in seen:
+                raise ValueError(f"{manifest}:{line_number}: duplicate case {key!r}")
+            seen.add(key)
+            specs.append(key)
+    if not specs:
+        raise ValueError(f"{manifest}: no cases found")
+    return specs
+
+
+def _build_case(cfg: dict, strategy: str, length: int, requested: str) -> dict:
+    dp, cp, ep = STRATEGIES[strategy]
+    batch = (
+        cfg["parallel"]["global_batch_size"] // dp
+        if cfg["parallel"]["batch_mode"] == "fixed_global"
+        else cfg["parallel"]["per_dp_batch_size"]
+    )
+    case = {
+        "strategy": strategy,
+        "dp": dp,
+        "cp": cp,
+        "ep": ep,
+        "batch_mode": cfg["parallel"]["batch_mode"],
+        "global_batch_size": dp * batch,
+        "per_dp_batch_size": batch,
+        "context_length": length,
+        "yoco_mode": cfg["yoco"]["mode"],
+        "keep_tokens": cfg["yoco"]["keep_tokens"],
+        "execution": cfg["workload"]["execution"],
+        "chunk_tokens_per_request": cfg["workload"]["chunk_tokens_per_request"],
+        "cache_source": "synthetic_hbm",
+        "config_hash": digest(cfg),
+    }
+    try:
+        case.update(normalize_prefix(length, requested, case["yoco_mode"], case["keep_tokens"], cfg["workload"]["alignment_policy"]))
+        trajectory = list(steps(case))
+        case.update(
+            status="PLANNED",
+            chunk_count=len(trajectory),
+            max_rows_per_rank=max(s["producer_padded_rows_per_rank"] for s in trajectory),
+            logical_cache_blocks=1 + batch * ((length + 127) // 128),
+            block_kv_payload_lower_bound_bytes=batch * ((length + 127) // 128) * 114048,
+            capacity_note="Block KV estimate only; native allocator padding, weights, Engram, state and workspaces excluded",
         )
-        for length in cfg["workload"]["context_lengths"]:
-            for requested in cfg["workload"]["cache_hit_rates"]:
-                case = {
-                    "strategy": strategy,
-                    "dp": dp,
-                    "cp": cp,
-                    "ep": ep,
-                    "batch_mode": cfg["parallel"]["batch_mode"],
-                    "global_batch_size": dp * batch,
-                    "per_dp_batch_size": batch,
-                    "context_length": length,
-                    "yoco_mode": cfg["yoco"]["mode"],
-                    "keep_tokens": cfg["yoco"]["keep_tokens"],
-                    "execution": cfg["workload"]["execution"],
-                    "chunk_tokens_per_request": cfg["workload"]["chunk_tokens_per_request"],
-                    "cache_source": "synthetic_hbm",
-                    "config_hash": digest(cfg),
-                }
-                try:
-                    case.update(
-                        normalize_prefix(length, requested, case["yoco_mode"], case["keep_tokens"], cfg["workload"]["alignment_policy"])
-                    )
-                    trajectory = list(steps(case))
-                    case.update(
-                        status="PLANNED",
-                        chunk_count=len(trajectory),
-                        max_rows_per_rank=max(s["producer_padded_rows_per_rank"] for s in trajectory),
-                        logical_cache_blocks=1 + batch * ((length + 127) // 128),
-                        block_kv_payload_lower_bound_bytes=batch * ((length + 127) // 128) * 114048,
-                        capacity_note="Block KV estimate only; native allocator padding, weights, Engram, state and workspaces excluded",
-                    )
-                except ValueError as error:
-                    case.update(status="INVALID_CONFIG", cache_hit_rate_requested=requested, error=str(error))
-                case["case_id"] = digest(case)[:20]
-                result.append(case)
-    return result
+    except ValueError as error:
+        case.update(status="INVALID_CONFIG", cache_hit_rate_requested=requested, error=str(error))
+    case["case_id"] = digest(case)[:20]
+    return case
+
+
+def plan(cfg: dict) -> list[dict]:
+    """Plan the Cartesian grid, or an explicit JSONL case ledger when requested."""
+    cases_file = cfg["workload"].get("cases_file")
+    if cases_file:
+        specs = _case_specs_from_file(cfg, cases_file)
+    else:
+        specs = (
+            (strategy, length, requested)
+            for strategy in cfg["parallel"]["strategies"]
+            for length in cfg["workload"]["context_lengths"]
+            for requested in cfg["workload"]["cache_hit_rates"]
+        )
+    return [_build_case(cfg, strategy, length, requested) for strategy, length, requested in specs]
 
 
 def case_capacity(case: dict, mtp_draft_length: int) -> int:

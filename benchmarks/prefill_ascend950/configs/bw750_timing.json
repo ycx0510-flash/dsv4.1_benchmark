@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "runtime": {
+    "weights": "dummy",
+    "engram": true
+  },
+  "parallel": {
+    "strategies": [
+      "DP8CP1EP8",
+      "DP4CP2EP8",
+      "DP2CP4EP8"
+    ],
+    "batch_mode": "fixed_per_dp",
+    "per_dp_batch_size": 1
+  },
+  "workload": {
+    "cases_file": "bw750_cases.jsonl",
+    "execution": "single_forward",
+    "chunk_tokens_per_request": null
+  },
+  "measurement": {
+    "warmup": 2,
+    "iterations": 2,
+    "rounds": 1
+  },
+  "profile": {
+    "enabled": false
+  },
+  "alignment": {
+    "enabled": false
+  },
+  "batch": {
+    "enabled": true,
+    "capacity_grouping": "power2",
+    "max_cases_per_group": 0
+  }
+}

@@ -6,6 +6,11 @@ set -euo pipefail
 
 ROOT=/mnt/xds/sfs/y30048898/DeepInfer
 cd "$ROOT"
+# Save the caller's LD_PRELOAD, then clear it so setup commands do not repeat
+# ld.so "cannot be preloaded" errors for host-absent entries; it is re-added
+# (filtered by existence) before exec below.
+CALLER_PRELOAD="${LD_PRELOAD:-}"
+export LD_PRELOAD=
 source build/prefill950-tools/prefill950-env.sh
 
 GCC14_ROOT=/mnt/xds/sfs/l00972766/rt/gcc-toolset-14-root
@@ -14,7 +19,21 @@ export PATH="$GCC14_ROOT/usr/bin:$PATH"
 export CC="$GCC14_ROOT/usr/bin/gcc"
 export CXX="$GCC14_ROOT/usr/bin/g++"
 export LD_LIBRARY_PATH="$GCC14_ROOT/usr/lib64:${LD_LIBRARY_PATH:-}"
-export LD_PRELOAD="$ROOT/build/prefill950-tools/compat/libmsprof_compat.so:/usr/lib64/libjemalloc.so.2:"
+
+# LD_PRELOAD: the msprof compat shim is required; keep existing entries only if
+# they exist on this host (images differ: e.g. /usr/lib64/libjemalloc.so.2 is
+# absent on some machines and only produces ld.so noise when preloaded).
+COMPAT_PRELOAD="$ROOT/build/prefill950-tools/compat/libmsprof_compat.so"
+[ -f "$COMPAT_PRELOAD" ] || { echo "missing $COMPAT_PRELOAD" >&2; exit 2; }
+PRELOAD="$COMPAT_PRELOAD"
+for entry in ${CALLER_PRELOAD//:/ }; do
+    [ -z "$entry" ] && continue
+    case "$entry" in
+        /*) [ -f "$entry" ] && PRELOAD="$PRELOAD:$entry" ;;
+        *) PRELOAD="$PRELOAD:$entry" ;;
+    esac
+done
+export LD_PRELOAD="$PRELOAD"
 
 # deep_jit resolves bisheng via ASCEND_HOME_PATH; use the hardened shim.
 export PREFILL950_JIT_ASCEND_HOME=$ROOT/build/prefill950-tools/ascend-toolkit-shim
