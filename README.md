@@ -2,7 +2,7 @@
 
 DeepSeek V4.1 Flash prefill benchmark on 8×Ascend 950 (DP8CP1EP8 / DP4CP2EP8 / DP2CP4EP8).
 
-- Benchmark source: [`benchmarks/prefill_ascend950/`](benchmarks/prefill_ascend950/) — see its README and DESIGN for the full contract
+- Benchmark source: [`prefill_ascend950/`](prefill_ascend950/) — see its README and DESIGN for the full contract
 - Runtime environment and local patches: [`ENVIRONMENT.md`](ENVIRONMENT.md), [`patches/`](patches/), [`env/`](env/)
 - 64K / 97% hit latency records: [`RESULTS-64K-h097.md`](RESULTS-64K-h097.md)
 
