@@ -574,24 +574,36 @@ def _run(
 
         profile = {"valid": None, "status": "DISABLED"}
         if cfg["profile"]["enabled"]:
-            selected = cfg["profile"]["ranks"] == "all" or rank == 0
+            backend = cfg["profile"].get("backend", "torch")
+            # ALOP/aclprof records device-side task time with much lower overhead
+            # than torch_npu.profiler, but a rank0-only ALOP pass is still not
+            # symmetric with the other ranks: 128K CP1 hit device error 507035
+            # (vector-core exception) after the profiled forwards, and CP2
+            # rank0-only torch profiling previously failed the same way.
+            # Always start ALOP on every rank; export_ranks still decides whose
+            # output survives. torch_npu.profiler keeps the historical policy.
+            selected = backend == "alop" or cfg["profile"]["ranks"] == "all" or rank == 0
             # Recording on every rank keeps the profiler overhead symmetric (required
             # for stable CP2 collection), but only export_ranks keep their traces.
             export_trace = cfg["profile"]["export_ranks"] == "all" or rank == 0
             profiler_directory = rank_directory / ("profiler" if export_trace else "profiler_discard")
+            # ALOP is a C-level backend: module input hooks are disabled unless
+            # the caller explicitly asks for them.
+            collect_shapes = bool(cfg["profile"].get("collect_module_shapes", backend != "alop"))
             state["profiling"] = selected
             profile = {"valid": None, "status": "SKIPPED", "rank": rank}
             shape_handles = []
             profiler, profile_error = None, None
             if selected:
-                shape_handles = [module.register_forward_pre_hook(shape_hook(name)) for name, module in model.named_modules()]
+                if collect_shapes:
+                    shape_handles = [module.register_forward_pre_hook(shape_hook(name)) for name, module in model.named_modules()]
                 try:
                     profiler = create_profiler(profiler_directory, cfg["profile"], rank)
                     profiler.start()
                 except Exception as error:
                     profile_error = f"{type(error).__name__}: {error}"
-            # All ranks run the same continuous profiling batch; only the selected
-            # rank records. No sync/barrier/restore is inserted between forwards.
+            # All ranks run the same continuous profiling batch; only selected
+            # ranks record. No sync/barrier/restore is inserted between forwards.
             error_state = {"error": profile_error}
             run_profile_batch(
                 sum(cfg["profile"][k] for k in ("wait_steps", "warmup_steps", "active_steps")),
@@ -613,17 +625,44 @@ def _run(
             if not export_trace:
                 # The discarded recording exists only to keep profiling overhead
                 # symmetric across ranks; never leave its trace on disk.
+                if selected:
+                    profile = {
+                        "valid": False if profile_error else bool(getattr(profiler, "valid", False)),
+                        "status": "FAILED" if profile_error else "DISCARDED",
+                        "backend": backend,
+                        "rank": rank,
+                        "note": "collected for symmetric per-rank overhead; output discarded",
+                    }
+                    if profile_error:
+                        profile["error"] = profile_error
                 shutil.rmtree(profiler_directory, ignore_errors=True)
             if export_trace:
-                write_jsonl(rank_directory / "module_shapes.jsonl", shape_records)
+                if collect_shapes:
+                    write_jsonl(rank_directory / "module_shapes.jsonl", shape_records)
                 expected = cfg["profile"]["active_steps"] * len(trajectory)
                 if profile_error:
                     profile = {"valid": False, "status": "FAILED", "error": profile_error, "expected_active_forwards": expected}
+                elif backend == "alop":
+                    alop_valid = bool(getattr(profiler, "valid", False))
+                    alop_exported = bool(getattr(profiler, "exported", False))
+                    if cfg["profile"].get("alop_export", True):
+                        alop_valid = alop_valid and alop_exported
+                    profile = {
+                        "valid": alop_valid,
+                        "status": "COLLECTED" if alop_valid else "FAILED",
+                        "backend": "alop",
+                        "exported": alop_exported,
+                        "collected_forwards": int(getattr(profiler, "steps", 0)),
+                        "expected_active_forwards": expected,
+                    }
+                    if getattr(profiler, "error", ""):
+                        profile["note"] = profiler.error
                 else:
                     # Raw traces stay on disk; parsing is deferred to offline analysis.
                     profile = {
                         "valid": None,
                         "status": "COLLECTED",
+                        "backend": "torch",
                         "expected_active_forwards": expected,
                         "note": "offline parsing pending",
                     }

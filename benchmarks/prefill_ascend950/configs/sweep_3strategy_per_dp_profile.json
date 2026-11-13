@@ -5,7 +5,9 @@
     "engram": true
   },
   "parallel": {
-    "strategies": ["DP4CP2EP8"],
+    "strategies": [
+      "DP8CP1EP8"
+    ],
     "batch_mode": "fixed_per_dp",
     "per_dp_batch_size": 1
   },
@@ -13,27 +15,34 @@
     "context_lengths": [
       131072
     ],
-    "cache_hit_rates": [0.8],
+    "cache_hit_rates": [
+      0.97
+    ],
     "execution": "single_forward",
     "chunk_tokens_per_request": null
   },
   "measurement": {
     "warmup": 0,
-    "iterations": 10,
+    "iterations": 3,
     "rounds": 1
   },
   "profile": {
     "enabled": true,
+    "backend": "alop",
+    "alop_export": true,
+    "collect_module_shapes": false,
+    "op_attr": false,
     "ranks": "all",
     "export_ranks": "rank0",
     "level": "Level1",
     "wait_steps": 0,
-    "warmup_steps": 0,
+    "warmup_steps": 1,
     "active_steps": 3,
-    "continuous": true,
-    "record_shapes": true,
+    "continuous": false,
+    "record_shapes": false,
     "with_stack": false,
-    "profile_memory": false
+    "profile_memory": false,
+    "alop_aicore_metrics": true
   },
   "batch": {
     "enabled": true,

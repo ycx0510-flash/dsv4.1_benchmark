@@ -234,8 +234,13 @@ def check(cfg: dict, devices: list[int], model_dir: Path, output: Path) -> dict:
             errors.append("Expected torch 2.13.0+cpu and torch_npu 2.13.0rc1")
         if not probe.get("engram_buffer"):
             errors.append("Ascend DeepEP EngramBuffer capability missing")
-        if cfg["profile"]["enabled"] and not all(probe["profiler_capabilities"].values()):
+        backend = cfg["profile"].get("backend", "torch")
+        if cfg["profile"]["enabled"] and backend == "torch" and not all(probe["profiler_capabilities"].values()):
             errors.append("Required torch_npu profiler capabilities missing")
+        if cfg["profile"]["enabled"] and backend == "alop":
+            root = cfg["profile"].get("alop_root") or os.environ.get("PREFILL950_ALOP_ROOT")
+            if not root or not (Path(root) / "ds41mini" / "tracing" / "alop.py").is_file():
+                errors.append("profile.backend=alop requires a valid alop_root/PREFILL950_ALOP_ROOT")
     compiler = command([os.environ.get("CXX", "g++"), "--version"])
     major = re.search(r"\b(\d+)\.\d+", compiler["output"])
     if compiler["exit_code"] or not major or int(major[1]) < 13:

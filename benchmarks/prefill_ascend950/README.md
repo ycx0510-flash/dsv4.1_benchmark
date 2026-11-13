@@ -19,7 +19,7 @@
 | MoE | 原生强制负载均衡；关闭强制倾斜和动态EPLB重排 |
 | 执行 | single_forward；可显式选择chunked_suffix处理长输入 |
 | 比较口径 | 默认fixed_global；另支持fixed_per_dp |
-| profiling | **默认关闭**（`profile.enabled=false`）；显式开启后独立采集pass，默认只采 rank0（`ranks=all` 可全采），采集时不解析 |
+| profiling | **默认关闭**（`profile.enabled=false`）；显式开启后独立采集pass，默认只采 rank0（`ranks=all` 可全采），采集时不解析；可选 `backend=alop` 做低开销 C 级 task-time 采集，所有 rank 参与、仅 rank0 导出 |
 
 首版不包含encoder SWA miss回放、DP异构长度/命中率、decode、采样、图像VE、外部KV存储或P→D网络传输。模型forward内原有的Engram、CP、HC、KV量化/读写、YOCO边界和DSpark cache preparation仍在测量中。
 
@@ -134,6 +134,51 @@ collect依次完成doctor、case plan、warmup、无profiler计时、独立profi
 
 `profile.enabled` 默认 false：benchmark 默认只做计时、不采集 trace。需要 profiling 时显式设为 true；CP 长上下文建议同时设置 `ranks=all`（对称采集，避免只采 rank0 时的 CP 错位崩溃）和 `export_ranks=rank0`（只保留 rank0 的 trace）。
 
+### 可选 ALOP C 级采集
+
+`profile.backend=alop` 时不再启动 `torch_npu.profiler`，而是复用 ds41_mini 的 ALOP/aclprof 适配器，采集 C 级 `task_time`，默认同时采集 `aicore_metrics`/PipeUtilization（无 Python profiler、无 `op_attr`、无 module shape hook），然后调用 `msprof --export=on` 导出 `task_time_*.csv`/`op_summary_*.csv`/DB。需要 `profile.alop_root` 或环境变量 `PREFILL950_ALOP_ROOT` 指向含 `ds41mini/tracing/alop.py` 的 checkout；不设置时仍用默认 torch 后端。
+
+```json
+"profile": {
+  "enabled": true,
+  "backend": "alop",
+  "alop_export": true,
+  "alop_aicore_metrics": true,
+  "collect_module_shapes": false,
+  "ranks": "rank0",
+  "export_ranks": "rank0",
+  "wait_steps": 0,
+  "warmup_steps": 1,
+  "active_steps": 3
+}
+```
+
+ALOP 与 torch profiler 不同，**即使配置 `ranks=rank0`，也会在所有 rank 上启动采集**，只按 `export_ranks` 保留输出；其余 rank 写入 `profiler_discard` 并在结束后删除。128K CP1/h0.98 实测 rank0-only ALOP 仍触发 device error 507035，而 all-rank 采集稳定。`record_shapes`/`level` 对 ALOP 不生效。`alop_aicore_metrics=true`（默认）会采集 PipeUtilization 级 AICore 指标并生成 `TASK_PMU_INFO`、48 列 `op_summary`，MindStudio 的 unified DB 导入依赖这些数据；关闭它可以降低开销，但 `op_summary` 会退回基础列，`msprof_*.db` 也可能无法被 MindStudio 识别。
+
+MindStudio 导入时选单文件 `PROF_*/msprof_*.db`，不要导入整个 `PROF_*`、case 或 run 目录，也不要把 `task_time_*.csv` 当成 MindStudio 输入。ALOP 在 profiling pass 开始后立即采集，因此包含 `wait+warmup+active` 的全部 forward；建议 `warmup_steps=1` 并在离线统计时跳过首个 forward（profiler 启动/首轮下发会多出几毫秒）。`profiler_index.json` 的 `valid` 要求采集启动且 `msprof` 导出成功；`exported` 单独记录。导出完成后的每个 forward span 可用工具离线统计：
+
+```bash
+python benchmarks/prefill_ascend950/tools/alop_forward_spans.py results/<run>/cases/<case> --warmup 1
+```
+
+如果这组 profiling 要导入 MindStudio，采集后先自检；退出码 0 且 `MindStudio DB ready: True` 才导入：
+
+```bash
+python benchmarks/prefill_ascend950/tools/check_alop_profile.py results/<run> --rank 0
+```
+
+自检会检查 `msprof_*.db` 的完整性、`TASK_PMU_INFO`、`TASK` 等表，以及 `op_summary` 是否为 48 列。缺 `TASK_PMU_INFO` 或 `op_summary` 只有 21 列时，说明采集时 `alop_aicore_metrics=false`，必须重采，不能靠重新 export 补出来。导入 MindStudio 时只选单个 `msprof_*.db`，不要导入 `PROF_*`/case/run 目录，也不要选 `task_time_*.csv`。
+
+128K 实测（timing 为无 profiler 的 rank0 NPU event span，ALOP 为 rank0 的 3 个 active forward kernel span）：
+
+| case | timing p50 | ALOP active mean | 单 forward span |
+|---|---:|---:|---|
+| DP8CP1EP8 L131072 h0.98，默认 PMU | 126.05 ms | 128.87 ms (+2.2%) | 128.93 / 129.31 / 128.36 ms |
+| DP4CP2EP8 L131072 h0.96，关闭 PMU | 139.73 ms | 134.47 ms (-3.8%) | 134.08 / 134.79 / 134.55 ms |
+
+差异在 ±4% 内，明显小于本 benchmark 原 torch Level1 + 全 rank + shape hook 的 130--178 ms 跨度；ALOP 的剩余差异来自逐 kernel 的设备 span 与无 profiler timing 的采样波动，不应把两个口径当成同一个数。CP2 行为早期 `alop_aicore_metrics=false` 的结果；默认开启 PMU 后需按同一配置重采。同一 CP2 配置以 `ranks=rank0` 声明（代码提升为 all-rank）复测：timing 139.87 ms、ALOP active mean 145.10 ms（+3.8%），无 507035。
+
+
 L是包含缓存前缀的完整输入长度。h使用[0,1]比例，例如0.9表示目标90%，不是90。
 
 `chunk_tokens_per_request` 默认关闭（`null`），默认执行方式是 `single_forward`，即每个 case 每次只做一次前向；只有显式设置 `execution=chunked_suffix` 并给出 `chunk_tokens_per_request` 时才启用分块。分块时 `forward` 是整条后缀（各 chunk 之和）的平均耗时，单 chunk 见 `forward_step`。
@@ -247,8 +292,8 @@ results/<run_id>/
       samples.jsonl / outcome.json / module_shapes.jsonl
       error.json / skipped.json   # 跳过的 case：失败 rank 写 error，其余 rank 写 skipped
       graph_signature_0.json / graph_signature_1.json
-      profiler_index.json         # 仅选中 rank（默认 rank0），采集后 status=COLLECTED
-      profiler/...                # 原生 Ascend trace/summary，仅选中 rank
+      profiler_index.json         # 仅导出 rank（默认 rank0），采集后 status=COLLECTED；ALOP 非导出 rank 在 outcome 中为 DISCARDED
+      profiler/...                # 原生 Ascend trace/summary（ALOP 时为 task_time 等 CSV），仅导出 rank
   doctor/doctor.json
   attempts/...                   # resume 时归档的失败尝试
 ```

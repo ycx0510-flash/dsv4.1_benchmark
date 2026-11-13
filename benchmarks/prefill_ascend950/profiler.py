@@ -48,6 +48,11 @@ def inspect_traces(directory: Path) -> dict:
 
 
 def create_profiler(directory: Path, cfg: dict, rank: int) -> Any:
+    if cfg.get("backend", "torch") == "alop":
+        from .alop_backend import AlopProfiler
+
+        return AlopProfiler(directory, cfg, rank)
+
     import torch_npu
 
     p = torch_npu.profiler
@@ -61,7 +66,7 @@ def create_profiler(directory: Path, cfg: dict, rank: int) -> Any:
     experimental = p._ExperimentalConfig(
         profiler_level=getattr(p.ProfilerLevel, cfg["level"]),
         data_simplification=False,
-        op_attr=True,
+        op_attr=bool(cfg.get("op_attr", True)),
         export_type=[p.ExportType.Db, p.ExportType.Text],
     )
     return p.profile(

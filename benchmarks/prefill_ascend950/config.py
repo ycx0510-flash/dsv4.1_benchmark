@@ -132,6 +132,17 @@ def resolve(raw: dict) -> dict:
             # Optional explicit case manifest; deliberately not in DEFAULTS so
             # existing configs keep their historical hash when it is absent.
             allowed |= {"cases_file"}
+        if section == "profile":
+            # Optional backend/shape controls; absent keeps the historical
+            # torch_npu profiler behavior and config hash.
+            allowed |= {
+                "backend",
+                "alop_root",
+                "alop_export",
+                "alop_aicore_metrics",
+                "collect_module_shapes",
+                "op_attr",
+            }
         if set(values) - allowed:
             raise ValueError(f"Unknown {section} keys: {sorted(set(values) - allowed)}")
         if section == "parallel" and values.get("batch_mode") == "fixed_per_dp":
@@ -223,6 +234,15 @@ def resolve(raw: dict) -> dict:
         raise ValueError("Profile requires ranks all/rank0 and Level0/Level1/Level2")
     if prof["export_ranks"] not in ("all", "rank0"):
         raise ValueError("Profile export_ranks must be all/rank0")
+    if prof.get("backend", "torch") not in ("torch", "alop"):
+        raise ValueError("profile.backend must be torch/alop")
+    for key in ("collect_module_shapes", "op_attr", "alop_export", "alop_aicore_metrics"):
+        if type(prof.get(key, True)) is not bool:
+            raise ValueError(f"profile.{key} must be a boolean")
+    if prof.get("alop_root") is not None and (
+        not isinstance(prof["alop_root"], str) or not prof["alop_root"].strip()
+    ):
+        raise ValueError("profile.alop_root must be a nonempty path string")
     for key in ("wait_steps", "warmup_steps", "active_steps"):
         integer(prof[key], f"profile.{key}", 1 if key == "active_steps" else 0)
     return cfg
